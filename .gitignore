@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+token.pickle
+.env
+output/
+credentials.json
