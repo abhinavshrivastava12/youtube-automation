@@ -28,18 +28,9 @@ def get_authenticated_service():
                 SCOPES
             )
 
-            # Generate auth URL
-            auth_url, _ = flow.authorization_url(prompt="consent")
-
-            print("\n🔐 Open this URL in browser:\n")
-            print(auth_url)
-
-            # Paste code
-            code = input("\nEnter authorization code: ")
-
-            # Exchange code for token
-            flow.fetch_token(code=code)
-            creds = flow.credentials
+            # ✅ FIX: run_local_server handles redirect_uri automatically
+            # It opens the browser, catches the callback, and exchanges the code
+            creds = flow.run_local_server(port=0)
 
         # Save token for next runs
         with open("token.pickle", "wb") as token:
