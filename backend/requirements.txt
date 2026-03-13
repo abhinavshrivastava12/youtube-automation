@@ -1,0 +1,16 @@
+flask
+flask-cors
+python-dotenv
+edge-tts
+Pillow
+groq
+
+# Optional providers (uncomment jo use karna ho):
+# google-generativeai
+# openai
+# anthropic
+
+# YouTube upload ke liye:
+# google-api-python-client
+# google-auth-oauthlib
+# google-auth-httplib2
