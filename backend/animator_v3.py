@@ -1,695 +1,404 @@
 """
-animator_v3.py
-==============
-• Story-matched characters: billi→cat, machli→fish, hathi→elephant etc.
-• Word-by-word karaoke typing animation
-• Suno MP3 as background music (mixed with TTS voice)
-• Story-matched emojis float across screen
-• Animated gradient backgrounds per rhyme theme
-• Big bouncing character matched to story
+animator_v3.py  — FIXED v4
+============================
+FIXES:
+  1. Hindi font: FreeSerifBold (Linux) / Nirmala (Windows) — NO MORE BOXES
+  2. Characters: 2x bigger, centered properly, NOT cut off
+  3. Bokeh circles: small + subtle, don't cover characters
+  4. Karaoke: clean word-by-word, proper pill design
+  5. Song mixing: robust fallback chain
 """
 
-import math, random, os
+import math, random, re
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 1080, 1920
 FPS  = 30
 
-# ── Font loader ───────────────────────────────────────────────────────────────
+# ── Font loader — Hindi support ───────────────────────────────────────────────
+# FreeSerifBold works on Linux (verified), Nirmala on Windows
+LINUX_BOLD = [
+    "/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    "/usr/share/fonts/opentype/unifont/unifont.otf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+LINUX_REG = [
+    "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    "/usr/share/fonts/opentype/unifont/unifont.otf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
+WIN_BOLD = [
+    "C:/Windows/Fonts/NirmalaB.ttf",
+    "C:/Windows/Fonts/mangalb.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+    "C:/Windows/Fonts/calibrib.ttf",
+]
+WIN_REG = [
+    "C:/Windows/Fonts/Nirmala.ttf",
+    "C:/Windows/Fonts/mangal.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/calibri.ttf",
+]
+
 _fc = {}
 def get_font(size, bold=False):
     key = (size, bold)
     if key in _fc: return _fc[key]
-    # Priority order: Windows fonts first (for user's PC), then Linux fallbacks
-    # FreeSerifBold/FreeSerif support Devanagari (Hindi) — verified working
-    candidates_bold = [
-        "C:/Windows/Fonts/NirmalaB.ttf",
-        "C:/Windows/Fonts/mangalb.ttf",
-        "C:/Windows/Fonts/arialbd.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-        "/usr/share/fonts/opentype/unifont/unifont.otf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ]
-    candidates_regular = [
-        "C:/Windows/Fonts/Nirmala.ttf",
-        "C:/Windows/Fonts/mangal.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        "/usr/share/fonts/opentype/unifont/unifont.otf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    pool = candidates_bold if bold else candidates_regular
-    # Also try the other pool as fallback
-    for path in pool + (candidates_regular if bold else candidates_bold):
+    candidates = (WIN_BOLD + LINUX_BOLD) if bold else (WIN_REG + LINUX_REG)
+    for path in candidates:
         try:
             f = ImageFont.truetype(path, size)
             _fc[key] = f
             return f
         except: pass
-    return ImageFont.load_default()
+    _fc[key] = ImageFont.load_default()
+    return _fc[key]
 
-def lerp(a, b, t):
-    t = max(0.0, min(1.0, t))
-    return a + (b - a) * t
+# ── Color helpers ─────────────────────────────────────────────────────────────
+def hex_to_rgb(h):
+    h = h.lstrip('#')
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 def lerp_col(c1, c2, t):
-    if isinstance(c1, str): c1 = tuple(int(c1.lstrip('#')[i:i+2],16) for i in (0,2,4))
-    if isinstance(c2, str): c2 = tuple(int(c2.lstrip('#')[i:i+2],16) for i in (0,2,4))
-    return tuple(int(lerp(c1[i], c2[i], t)) for i in range(3))
+    if isinstance(c1, str): c1 = hex_to_rgb(c1)
+    if isinstance(c2, str): c2 = hex_to_rgb(c2)
+    t = max(0.0, min(1.0, t))
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
 
-def ease_out(t):
-    return 1 - (1-min(1,t))**3
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  STORY → CHARACTER + THEME MAPPING
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ── Story config ──────────────────────────────────────────────────────────────
 STORY_CONFIG = {
-    # keyword → config
-    "billi":   {"char":"cat",      "bg":("🌸 Pastel","#ff9a9e","#fecfef"), "emojis":["🐱","🥛","🐟","🌸","🍼","🌙"]},
-    "cat":     {"char":"cat",      "bg":("🌸 Pastel","#ff9a9e","#fecfef"), "emojis":["🐱","🥛","🐟","🌸","🍼","🌙"]},
-    "machli":  {"char":"fish",     "bg":("🌊 Ocean", "#0096c7","#caf0f8"), "emojis":["🐟","🐠","🌊","🐬","🐚","💧"]},
-    "fish":    {"char":"fish",     "bg":("🌊 Ocean", "#0096c7","#caf0f8"), "emojis":["🐟","🐠","🌊","🐬","🐚","💧"]},
-    "hathi":   {"char":"elephant", "bg":("🌿 Forest","#52b788","#b7e4c7"), "emojis":["🐘","🌿","🍃","🌳","🍎","🌺"]},
-    "elephant":{"char":"elephant", "bg":("🌿 Forest","#52b788","#b7e4c7"), "emojis":["🐘","🌿","🍃","🌳","🍎","🌺"]},
-    "chanda":  {"char":"moon",     "bg":("🌙 Night", "#03045e","#023e8a"), "emojis":["🌙","⭐","✨","💫","🌟","🌛"]},
-    "mama":    {"char":"moon",     "bg":("🌙 Night", "#03045e","#023e8a"), "emojis":["🌙","⭐","✨","💫","🌟","🌛"]},
-    "tara":    {"char":"star",     "bg":("🌌 Space", "#10002b","#3c096c"), "emojis":["⭐","🌟","💫","✨","🚀","🌙"]},
-    "twinkle": {"char":"star",     "bg":("🌌 Space", "#10002b","#3c096c"), "emojis":["⭐","🌟","💫","✨","🚀","🌙"]},
-    "lakdi":   {"char":"horse",    "bg":("🌅 Sunset","#ff6b35","#ffd166"), "emojis":["🐴","🌅","🌾","🏇","💨","🌻"]},
-    "ghoda":   {"char":"horse",    "bg":("🌅 Sunset","#ff6b35","#ffd166"), "emojis":["🐴","🌅","🌾","🏇","💨","🌻"]},
-    "johny":   {"char":"kid",      "bg":("🍭 Candy", "#ff99c8","#fcf6bd"), "emojis":["👶","🍭","🍬","🎈","🍰","🌈"]},
-    "nani":    {"char":"peacock",  "bg":("🌿 Garden","#2d6a4f","#74c69d"), "emojis":["🦚","🌸","🌺","🌻","🍃","🦋"]},
-    "morni":   {"char":"peacock",  "bg":("🌿 Garden","#2d6a4f","#74c69d"), "emojis":["🦚","🌸","🌺","🌻","🍃","🦋"]},
-    "titli":   {"char":"butterfly","bg":("🌸 Meadow","#56cfe1","#e0fbfc"), "emojis":["🦋","🌸","🌼","🌿","☀️","🌈"]},
-    "default": {"char":"kid",      "bg":("🌈 Rainbow","#f72585","#7209b7"),"emojis":["⭐","🌈","✨","🎵","💫","🌸"]},
+    "billi":   {"char":"cat",       "bg":("#ff9a9e","#fecfef"), "dot_col":"#ff6b9d"},
+    "cat":     {"char":"cat",       "bg":("#ff9a9e","#fecfef"), "dot_col":"#ff6b9d"},
+    "machli":  {"char":"fish",      "bg":("#0096c7","#caf0f8"), "dot_col":"#48cae4"},
+    "fish":    {"char":"fish",      "bg":("#0096c7","#caf0f8"), "dot_col":"#48cae4"},
+    "hathi":   {"char":"elephant",  "bg":("#52b788","#b7e4c7"), "dot_col":"#40916c"},
+    "chanda":  {"char":"moon",      "bg":("#03045e","#023e8a"), "dot_col":"#4895ef"},
+    "mama":    {"char":"moon",      "bg":("#03045e","#023e8a"), "dot_col":"#4895ef"},
+    "tara":    {"char":"star",      "bg":("#10002b","#3c096c"), "dot_col":"#9d4edd"},
+    "twinkle": {"char":"star",      "bg":("#10002b","#3c096c"), "dot_col":"#9d4edd"},
+    "lakdi":   {"char":"horse",     "bg":("#ff6b35","#ffd166"), "dot_col":"#f4a261"},
+    "johny":   {"char":"kid",       "bg":("#ff99c8","#fcf6bd"), "dot_col":"#ff85a1"},
+    "nani":    {"char":"peacock",   "bg":("#2d6a4f","#74c69d"), "dot_col":"#52b788"},
+    "lori":    {"char":"moon",      "bg":("#1a1a2e","#16213e"), "dot_col":"#e2b714"},
+    "default": {"char":"kid",       "bg":("#f72585","#7209b7"), "dot_col":"#b5179e"},
 }
 
-def get_story_config(title_or_lines):
-    """Auto-detect story type from title/lines text"""
-    text = title_or_lines.lower() if title_or_lines else ""
-    for keyword, cfg in STORY_CONFIG.items():
-        if keyword in text and keyword != "default":
+def get_story_config(text):
+    text = (text or "").lower()
+    for kw, cfg in STORY_CONFIG.items():
+        if kw in text and kw != "default":
             return cfg
     return STORY_CONFIG["default"]
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  BACKGROUNDS
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ── Background ────────────────────────────────────────────────────────────────
 def draw_bg(d, col1, col2, t):
     for y in range(H):
         yf = y / H
-        wave = math.sin(yf * math.pi * 3 + t * 0.7) * 0.04
+        wave = math.sin(yf * math.pi * 4 + t * 0.6) * 0.03
         col = lerp_col(col1, col2, max(0, min(1, yf + wave)))
         d.line([(0, y), (W, y)], fill=col)
 
-def draw_bokeh(d, accents, t):
+def draw_subtle_bokeh(d, dot_col, t):
+    """Small subtle floating dots — don't cover characters"""
     rng = random.Random(42)
-    for i in range(18):
-        cr  = rng.randint(40, 160)
-        sx  = rng.uniform(0, W)
-        sy  = rng.uniform(0, H)
-        spd = rng.uniform(25, 80)
-        ph  = rng.random() * 10
-        col = rng.choice(accents)
-        cx  = int((sx + math.sin(t*0.4+ph)*80) % W)
-        cy  = int((sy - t*spd + ph*300) % H)
-        for r in range(cr, 0, -20):
-            fc = lerp_col(col, (255,255,255), 1-r/cr)
-            fc = tuple(min(255,c) for c in fc)
-            d.ellipse([cx-r,cy-r,cx+r,cy+r], fill=fc)
+    dot_rgb = hex_to_rgb(dot_col) if isinstance(dot_col, str) else dot_col
+    light = tuple(min(255, c + 80) for c in dot_rgb)
+    for i in range(10):
+        r = rng.randint(12, 45)
+        sx = rng.uniform(0.05, 0.95) * W
+        sy = rng.uniform(0.05, 0.50) * H   # only top 50%
+        sp = rng.uniform(15, 50)
+        ph = rng.random() * 10
+        cx = int((sx + math.sin(t * 0.4 + ph) * 60) % W)
+        cy = int((sy - t * sp + ph * 200) % (H * 0.50))
+        d.ellipse([cx-r, cy-r, cx+r, cy+r], fill=light)
 
-def draw_stars(d, t):
+def draw_stars_bg(d, t):
+    """For dark themes (moon/star/lori)"""
     rng = random.Random(99)
-    for _ in range(200):
+    for _ in range(150):
         sx = rng.randint(0, W)
-        sy = rng.randint(0, int(H*0.85))
-        fl = 0.3 + 0.7*abs(math.sin(t*rng.uniform(1,5)+rng.random()*6.28))
-        br = int(150*fl+80)
-        sr = rng.choice([1,1,2,2,3])
-        d.ellipse([sx-sr,sy-sr,sx+sr,sy+sr], fill=(br,br,min(255,br+20)))
-
-# Emoji → shape/color mapping for story types
-EMOJI_SHAPES = {
-    # cat/billi
-    "🐱": ("circle",  (255,140,50)),
-    "🥛": ("circle",  (240,240,255)),
-    "🌸": ("star4",   (255,150,180)),
-    "🍼": ("circle",  (200,230,255)),
-    # fish/machli
-    "🐟": ("diamond", (50,180,255)),
-    "🌊": ("wave",    (0,150,220)),
-    "🐠": ("diamond", (255,120,50)),
-    "🐚": ("circle",  (255,210,150)),
-    # elephant
-    "🐘": ("circle",  (180,160,200)),
-    "🌿": ("star4",   (80,180,80)),
-    "🍃": ("star4",   (100,200,100)),
-    # moon/stars
-    "🌙": ("crescent",(255,230,50)),
-    "⭐": ("star5",   (255,230,50)),
-    "✨": ("star4",   (255,255,200)),
-    "💫": ("star4",   (220,200,255)),
-    "🌟": ("star5",   (255,220,50)),
-    # horse
-    "🐴": ("circle",  (160,90,30)),
-    "🌅": ("circle",  (255,150,50)),
-    "🌾": ("star4",   (220,180,50)),
-    # peacock
-    "🦚": ("star5",   (0,180,100)),
-    # butterfly
-    "🦋": ("diamond", (255,100,200)),
-    # kid/default
-    "🎈": ("circle",  (255,80,80)),
-    "🍭": ("star4",   (255,100,200)),
-    "🌈": ("star5",   (255,180,50)),
-    "🎵": ("note",    (180,100,255)),
-}
-
-def draw_shape(d, shape, cx, cy, size, color):
-    r = size
-    if shape == "circle":
-        d.ellipse([cx-r,cy-r,cx+r,cy+r], fill=color)
-        # shine
-        sr = r//3
-        shine = tuple(min(255,c+80) for c in color)
-        d.ellipse([cx-r+4,cy-r+4,cx-r+4+sr,cy-r+4+sr], fill=shine)
-    elif shape == "star5":
-        pts = []
-        for i in range(10):
-            angle = i/10*2*math.pi - math.pi/2
-            dist = r if i%2==0 else r//2
-            pts.append((cx+int(dist*math.cos(angle)), cy+int(dist*math.sin(angle))))
-        d.polygon(pts, fill=color)
-    elif shape == "star4":
-        pts = []
-        for i in range(8):
-            angle = i/8*2*math.pi - math.pi/4
-            dist = r if i%2==0 else r//3
-            pts.append((cx+int(dist*math.cos(angle)), cy+int(dist*math.sin(angle))))
-        d.polygon(pts, fill=color)
-    elif shape == "diamond":
-        d.polygon([(cx,cy-r),(cx+r,cy),(cx,cy+r),(cx-r,cy)], fill=color)
-    elif shape == "crescent":
-        d.ellipse([cx-r,cy-r,cx+r,cy+r], fill=color)
-        # cutout using a lighter version to simulate crescent
-        lighter = tuple(min(255,c+90) for c in color)
-        d.ellipse([cx+r//3,cy-r+r//4,cx+r//3+r,cy+r-r//4], fill=(255,200,220))
-    elif shape == "note":
-        d.ellipse([cx-r//2,cy,cx+r//2,cy+r], fill=color)
-        d.line([(cx+r//2,cy),(cx+r//2,cy-r)], fill=color, width=r//5)
-    elif shape == "wave":
-        # Draw as concentric rings
-        for i in range(3):
-            ri = r - i*(r//3)
-            if ri > 4:
-                d.ellipse([cx-ri,cy-ri//3,cx+ri,cy+ri//3], outline=color, width=max(2,r//8))
-
-def draw_floating_emojis(d, emojis, t):
-    rng = random.Random(77)
-    for i in range(6):
-        em = emojis[i % len(emojis)]
-        sx = rng.uniform(0.05, 0.88)*W
-        sy = rng.uniform(0.05, 0.82)*H
-        sp = rng.uniform(30, 85)
-        ph = rng.random()*10
-        sw = math.sin(t*rng.uniform(0.4,1.1)+ph)*65
-        ex = int((sx+sw) % W)
-        ey = int((sy - t*sp + ph*260) % (H*0.60))  # keep in upper 60% only
-        size = rng.randint(22, 48)
-        pulse = 1.0 + 0.15*math.sin(t*2+i)
-        sz = int(size*pulse)
-        # Get shape config
-        shape_info = EMOJI_SHAPES.get(em, ("circle", (200,200,255)))
-        shape, color = shape_info
-        # Add transparency feel via lighter color
-        lighter = tuple(min(255, c+60) for c in color)
-        try:
-            draw_shape(d, shape, ex, ey, sz, lighter)
-        except: pass
+        sy = rng.randint(0, int(H * 0.55))
+        fl = 0.3 + 0.7 * abs(math.sin(t * rng.uniform(1, 5) + rng.random() * 6.28))
+        br = int(150 * fl + 80)
+        sr = rng.choice([1, 1, 2, 2, 3])
+        d.ellipse([sx-sr, sy-sr, sx+sr, sy+sr], fill=(br, br, min(255, br+20)))
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CHARACTERS  — story-matched
+#  CHARACTERS — all bigger, centered properly
 # ══════════════════════════════════════════════════════════════════════════════
 
 def draw_cat(d, cx, cy, t):
-    """Cute cartoon cat — for Billi Mausi"""
-    bounce = int(abs(math.sin(t*3.5))*28)
+    """Big cute bouncing cat"""
+    bounce = int(abs(math.sin(t * 3.5)) * 35)
     cy -= bounce
 
-    body_col  = (255,140,50)
-    belly_col = (255,200,150)
-    ear_col   = (220,90,25)
-    inner_ear = (255,170,185)
+    bc  = (255, 140, 50)
+    bel = (255, 200, 150)
+    ec  = (220, 90,  25)
+    ie  = (255, 170, 185)
 
     # Shadow
-    d.ellipse([cx-70,cy+125,cx+70,cy+145], fill=(30,15,10))
+    d.ellipse([cx-95, cy+155, cx+95, cy+182], fill=(180, 80, 100))
 
     # Tail
-    tail_pts = []
-    for i in range(18):
-        angle = i/18*math.pi + t*0.9
-        tx2 = cx + 75 + int(35*math.sin(angle))
-        ty2 = cy + 35 - i*7
-        tail_pts.append((tx2,ty2))
-    if len(tail_pts)>1:
-        for pi in range(len(tail_pts)-1):
-            d.line([tail_pts[pi],tail_pts[pi+1]], fill=body_col, width=20)
-    if tail_pts:
-        d.ellipse([tail_pts[-1][0]-12,tail_pts[-1][1]-12,
-                   tail_pts[-1][0]+12,tail_pts[-1][1]+12], fill=(255,175,75))
+    px, py = None, None
+    for i in range(20):
+        ang = i / 20 * math.pi + t * 0.9
+        tx2 = cx + 108 + int(50 * math.sin(ang))
+        ty2 = cy + 42 - i * 10
+        if px is not None:
+            d.line([(px, py), (tx2, ty2)], fill=bc, width=28)
+        px, py = tx2, ty2
+    if px:
+        d.ellipse([px-16, py-16, px+16, py+16], fill=(255, 175, 75))
 
     # Body
-    d.ellipse([cx-68,cy-90,cx+68,cy+42], fill=body_col)
-    d.ellipse([cx-36,cy-58,cx+36,cy+28], fill=belly_col)
-
-    # --- HEAD (separate coords, always relative to body top) ---
-    hr = 68              # head radius
-    hx = cx
-    hy = cy - 90 - hr + 10   # head center Y = body top minus head radius + small overlap
-
-    # Ears FIRST (drawn behind head)
-    # Left ear: base at (-35, hy-10), tip at (-30, hy-hr-52)
-    d.polygon([
-        (hx-55, hy+10),
-        (hx-25, hy-hr-48),
-        (hx-5,  hy-hr+8),
-    ], fill=ear_col)
-    d.polygon([
-        (hx-48, hy+5),
-        (hx-27, hy-hr-32),
-        (hx-8,  hy-hr+5),
-    ], fill=inner_ear)
-    # Right ear
-    d.polygon([
-        (hx+55, hy+10),
-        (hx+25, hy-hr-48),
-        (hx+5,  hy-hr+8),
-    ], fill=ear_col)
-    d.polygon([
-        (hx+48, hy+5),
-        (hx+27, hy-hr-32),
-        (hx+8,  hy-hr+5),
-    ], fill=inner_ear)
-
-    # Head circle (drawn OVER ears base)
-    d.ellipse([hx-hr, hy-hr, hx+hr, hy+hr], fill=body_col)
-
-    # Eyes
-    blink = abs(math.sin(t*0.6)) > 0.93
-    for xo in [-22,22]:
-        ex2,ey2 = hx+xo, hy-6
-        if blink:
-            d.arc([ex2-15,ey2-4,ex2+15,ey2+4], 195,345, fill=(40,25,8), width=5)
-        else:
-            d.ellipse([ex2-15,ey2-13,ex2+15,ey2+13], fill=(255,255,255))
-            d.ellipse([ex2-7, ey2-12,ex2+7, ey2+12], fill=(40,25,8))
-            d.ellipse([ex2-4, ey2-10,ex2,   ey2-5],  fill=(255,255,255))
-            d.arc([ex2-14,ey2-12,ex2+14,ey2+12], 0,360, fill=(70,170,70), width=3)
-
-    # Nose
-    d.polygon([(hx,hy+10),(hx-7,hy+1),(hx+7,hy+1)], fill=(255,110,145))
-    # Mouth
-    d.arc([hx-14,hy+12,hx+14,hy+28], 15,165, fill=(170,55,75), width=4)
-    # Cheeks
-    for xo in [-40,40]:
-        d.ellipse([hx+xo-15,hy+4,hx+xo+15,hy+20], fill=(255,155,155))
-    # Whiskers
-    wy = hy+14
-    for wx1,wx2,wy1,wy2 in [(-12,-58,2,-6),(-12,-55,6,-2),(-12,-52,10,2)]:
-        d.line([(hx+wx1,wy+wy1),(hx+wx2,wy+wy2)], fill=(200,155,115), width=2)
-    for wx1,wx2,wy1,wy2 in [(12,58,2,-6),(12,55,6,-2),(12,52,10,2)]:
-        d.line([(hx+wx1,wy+wy1),(hx+wx2,wy+wy2)], fill=(200,155,115), width=2)
-
-    # Paws waving
-    aw = math.sin(t*3.5)*32
-    d.line([cx-65,cy-18,cx-108,cy-42-int(aw)], fill=body_col, width=24)
-    d.ellipse([cx-124,cy-58-int(aw)-16,cx-96,cy-58-int(aw)+16], fill=body_col)
-    d.line([cx+65,cy-18,cx+108,cy-42+int(aw)], fill=body_col, width=24)
-    d.ellipse([cx+96,cy-58+int(aw)-16,cx+124,cy-58+int(aw)+16], fill=body_col)
-
-    # Legs
-    lk = int(math.sin(t*3.5)*8)
-    for xo in [-25,25]:
-        d.rounded_rectangle([cx+xo-20,cy+28+lk,cx+xo+20,cy+60+lk], radius=10, fill=body_col)
-
-    # Legs
-    lk = int(math.sin(t*3.5)*10)
-    for xo in [-28,28]:
-        d.ellipse([cx+xo-22,cy+22+lk,cx+xo+22,cy+58+lk], fill=body_col)
-
-def draw_fish(d, cx, cy, t):
-    """Cute cartoon fish — for Machli"""
-    swim_x = int(math.sin(t*1.8)*60)
-    swim_y = int(math.sin(t*2.5)*20)
-    cx += swim_x
-    cy += swim_y
-
-    # Body
-    body_col = (50,180,255)
-    scale_col = (30,140,220)
-    d.ellipse([cx-100,cy-55,cx+100,cy+55], fill=body_col)
-    # Scale pattern
-    for i in range(3):
-        for j in range(2):
-            sx2 = cx - 60 + i*45
-            sy2 = cy - 20 + j*35
-            d.arc([sx2-20,sy2-15,sx2+20,sy2+15], 0,180, fill=scale_col, width=3)
-
-    # Tail fin
-    tail_wave = int(math.sin(t*4)*18)
-    d.polygon([
-        (cx+90,cy-8+tail_wave),(cx+90,cy+8+tail_wave),
-        (cx+140,cy-50),(cx+140,cy+50)
-    ], fill=(30,140,220))
-
-    # Dorsal fin
-    d.polygon([(cx-20,cy-55),(cx+20,cy-55),(cx,cy-95)], fill=(30,140,220))
-
-    # Eye
-    d.ellipse([cx-65,cy-20,cx-35,cy+10], fill=(255,255,255))
-    d.ellipse([cx-58,cy-15,cx-42,cy+5], fill=(20,20,20))
-    d.ellipse([cx-55,cy-13,cx-50,cy-8], fill=(255,255,255))
-
-    # Smile
-    d.arc([cx-55,cy+5,cx-20,cy+30], 10,160, fill=(255,255,255), width=4)
-
-    # Bubbles
-    for i in range(3):
-        bx = cx - 80 + i*8
-        by = cy - 50 - i*25 - int(t*30 + i*15) % 80
-        br2 = 8 + i*4
-        d.ellipse([bx-br2,by-br2,bx+br2,by+br2], fill=(200,235,255))
-        d.arc([bx-br2,by-br2,bx+br2,by+br2], 200,310, fill=(255,255,255), width=2)
-
-def draw_elephant(d, cx, cy, t):
-    """Cute cartoon elephant — for Hathi Raja"""
-    bounce = int(abs(math.sin(t*2.5))*20)
-    cy -= bounce
-
-    col = (180,160,200)
-    dark = (140,120,165)
-
-    # Shadow
-    d.ellipse([cx-95,cy+145,cx+95,cy+168], fill=(0,0,0))
-
-    # Body
-    d.ellipse([cx-95,cy-110,cx+95,cy+50], fill=col)
+    d.ellipse([cx-98, cy-125, cx+98, cy+65], fill=bc)
+    d.ellipse([cx-52, cy-82,  cx+52, cy+42], fill=bel)
 
     # Head
-    d.ellipse([cx-80,cy-170,cx+80,cy-20], fill=col)
+    hr = 105; hx = cx; hy = cy - 125 - hr + 14
 
-    # Trunk — curvy, animates
-    trunk_pts = []
-    for i in range(12):
-        tx2 = cx - int(30*math.sin(i*0.4 + t*1.5))
-        ty2 = cy - 20 + i*18
-        trunk_pts.append((tx2,ty2))
-    for pi in range(len(trunk_pts)-1):
-        d.line([trunk_pts[pi],trunk_pts[pi+1]], fill=col, width=34)
-    if trunk_pts:
-        d.ellipse([trunk_pts[-1][0]-18,trunk_pts[-1][1]-10,
-                   trunk_pts[-1][0]+18,trunk_pts[-1][1]+16], fill=dark)
+    # Ears (draw before head)
+    d.polygon([(hx-78, hy+14), (hx-35, hy-hr-70), (hx-8,  hy-hr+12)], fill=ec)
+    d.polygon([(hx-68, hy+8),  (hx-37, hy-hr-48), (hx-12, hy-hr+8)],  fill=ie)
+    d.polygon([(hx+78, hy+14), (hx+35, hy-hr-70), (hx+8,  hy-hr+12)], fill=ec)
+    d.polygon([(hx+68, hy+8),  (hx+37, hy-hr-48), (hx+12, hy-hr+8)],  fill=ie)
 
-    # Ears — big flappy
-    ear_flap = int(math.sin(t*2)*8)
-    d.ellipse([cx-120-ear_flap,cy-155,cx-30-ear_flap,cy-30], fill=dark)
-    d.ellipse([cx-110-ear_flap,cy-145,cx-40-ear_flap,cy-45], fill=(220,190,220))
-    d.ellipse([cx+30+ear_flap,cy-155,cx+120+ear_flap,cy-30], fill=dark)
-    d.ellipse([cx+40+ear_flap,cy-145,cx+110+ear_flap,cy-45], fill=(220,190,220))
+    # Head
+    d.ellipse([hx-hr, hy-hr, hx+hr, hy+hr], fill=bc)
 
     # Eyes
-    blink = abs(math.sin(t*0.5))>0.94
-    for xo in [-28,28]:
-        ex2,ey2 = cx+xo, cy-100
+    blink = abs(math.sin(t * 0.6)) > 0.93
+    for xo in [-32, 32]:
+        ex2, ey2 = hx + xo, hy - 9
         if blink:
-            d.arc([ex2-14,ey2-5,ex2+14,ey2+5], 195,345, fill=(60,40,20), width=5)
+            d.arc([ex2-20, ey2-6, ex2+20, ey2+6], 195, 345, fill=(40,25,8), width=7)
         else:
-            d.ellipse([ex2-14,ey2-14,ex2+14,ey2+14], fill=(255,255,255))
-            d.ellipse([ex2-8,ey2-10,ex2+8,ey2+10], fill=(40,25,15))
-            d.ellipse([ex2-5,ey2-9,ex2+0,ey2-4], fill=(255,255,255))
+            d.ellipse([ex2-20, ey2-18, ex2+20, ey2+18], fill=(255,255,255))
+            d.ellipse([ex2-11, ey2-16, ex2+11, ey2+16], fill=(40,25,8))
+            d.ellipse([ex2-6,  ey2-14, ex2-1,  ey2-8],  fill=(255,255,255))
+            d.arc([ex2-19, ey2-17, ex2+19, ey2+17], 0, 360, fill=(70,170,70), width=3)
 
-    # Tusks
-    d.arc([cx-50,cy-55,cx-10,cy+10], 200,290, fill=(255,240,200), width=12)
-    d.arc([cx+10,cy-55,cx+50,cy+10], 250,340, fill=(255,240,200), width=12)
+    # Nose
+    d.polygon([(hx, hy+14), (hx-11, hy+3), (hx+11, hy+3)], fill=(255,110,145))
+    d.arc([hx-20, hy+16, hx+20, hy+40], 15, 165, fill=(170,55,75), width=5)
+
+    # Cheeks
+    for xo in [-56, 56]:
+        d.ellipse([hx+xo-22, hy+6, hx+xo+22, hy+30], fill=(255,155,155))
+
+    # Whiskers
+    wy = hy + 18
+    for wx1, wx2, wy1, wy2 in [(-18,-80,2,-9),(-18,-76,9,-2),(-18,-72,16,5)]:
+        d.line([(hx+wx1, wy+wy1), (hx+wx2, wy+wy2)], fill=(200,155,115), width=3)
+    for wx1, wx2, wy1, wy2 in [(18,80,2,-9),(18,76,9,-2),(18,72,16,5)]:
+        d.line([(hx+wx1, wy+wy1), (hx+wx2, wy+wy2)], fill=(200,155,115), width=3)
+
+    # Arms waving
+    aw = math.sin(t * 3.5) * 48
+    d.line([cx-95, cy-26, cx-155, cy-62-int(aw)], fill=bc, width=34)
+    d.ellipse([cx-179, cy-86-int(aw)-24, cx-135, cy-86-int(aw)+24], fill=bc)
+    d.line([cx+95, cy-26, cx+155, cy-62+int(aw)], fill=bc, width=34)
+    d.ellipse([cx+135, cy-86+int(aw)-24, cx+179, cy-86+int(aw)+24], fill=bc)
 
     # Legs
-    lk = int(math.sin(t*2.5)*12)
-    for xo in [-40,40]:
-        d.rounded_rectangle([cx+xo-22,cy+30+lk,cx+xo+22,cy+100+lk],radius=10,fill=col)
-        d.ellipse([cx+xo-24,cy+85+lk,cx+xo+24,cy+110+lk],fill=dark)
+    lk = int(math.sin(t * 3.5) * 14)
+    for xo in [-36, 36]:
+        d.ellipse([cx+xo-32, cy+36+lk, cx+xo+32, cy+88+lk], fill=bc)
+
+
+def draw_fish(d, cx, cy, t):
+    swim_x = int(math.sin(t * 1.8) * 70)
+    swim_y = int(math.sin(t * 2.5) * 25)
+    cx += swim_x; cy += swim_y
+    bc = (50, 180, 255); sc = (30, 140, 220)
+    d.ellipse([cx-120, cy-68, cx+120, cy+68], fill=bc)
+    for i in range(3):
+        for j in range(2):
+            sx2 = cx-72+i*54; sy2 = cy-25+j*42
+            d.arc([sx2-24, sy2-18, sx2+24, sy2+18], 0, 180, fill=sc, width=4)
+    tw = int(math.sin(t * 4) * 22)
+    d.polygon([(cx+108, cy-10+tw),(cx+108, cy+10+tw),(cx+168, cy-62),(cx+168, cy+62)], fill=sc)
+    d.polygon([(cx-24, cy-68),(cx+24, cy-68),(cx, cy-115)], fill=sc)
+    d.ellipse([cx-78, cy-24, cx-42, cy+14], fill=(255,255,255))
+    d.ellipse([cx-70, cy-18, cx-50, cy+6],  fill=(20,20,20))
+    d.ellipse([cx-67, cy-16, cx-61, cy-10], fill=(255,255,255))
+    d.arc([cx-66, cy+6, cx-24, cy+36], 10, 160, fill=(255,255,255), width=5)
+    for i in range(3):
+        bx = cx-96+i*10; by = int((cy-60-i*30-t*36+i*18)%(H*0.4)); br2=10+i*5
+        d.ellipse([bx-br2, by-br2, bx+br2, by+br2], fill=(200,235,255))
+
+
+def draw_elephant(d, cx, cy, t):
+    bounce = int(abs(math.sin(t * 2.5)) * 22); cy -= bounce
+    col=(180,160,200); dark=(140,120,165)
+    d.ellipse([cx-110, cy+155, cx+110, cy+182], fill=(30,30,30))
+    d.ellipse([cx-110, cy-130, cx+110, cy+60], fill=col)
+    d.ellipse([cx-95,  cy-200, cx+95,  cy-24],  fill=col)
+    px, py = None, None
+    for i in range(14):
+        tx2 = cx - int(36 * math.sin(i * 0.4 + t * 1.5))
+        ty2 = cy - 24 + i * 22
+        if px: d.line([(px,py),(tx2,ty2)], fill=col, width=40)
+        px, py = tx2, ty2
+    ear_f = int(math.sin(t * 2) * 10)
+    d.ellipse([cx-145-ear_f, cy-185, cx-36-ear_f, cy-36], fill=dark)
+    d.ellipse([cx-132-ear_f, cy-172, cx-48-ear_f, cy-54], fill=(220,190,220))
+    d.ellipse([cx+36+ear_f,  cy-185, cx+145+ear_f, cy-36], fill=dark)
+    d.ellipse([cx+48+ear_f,  cy-172, cx+132+ear_f, cy-54], fill=(220,190,220))
+    blink = abs(math.sin(t * 0.5)) > 0.94
+    for xo in [-34, 34]:
+        ex2, ey2 = cx+xo, cy-120
+        if blink: d.arc([ex2-16, ey2-6, ex2+16, ey2+6], 195, 345, fill=(60,40,20), width=6)
+        else:
+            d.ellipse([ex2-16, ey2-16, ex2+16, ey2+16], fill=(255,255,255))
+            d.ellipse([ex2-9,  ey2-12, ex2+9,  ey2+12], fill=(40,25,15))
+    lk = int(math.sin(t * 2.5) * 14)
+    for xo in [-48, 48]:
+        d.rounded_rectangle([cx+xo-26, cy+36+lk, cx+xo+26, cy+120+lk], radius=12, fill=col)
+
 
 def draw_moon_character(d, cx, cy, t):
-    """Cute crescent moon face — for Chanda Mama"""
-    glow = int(abs(math.sin(t*1.5))*20)
-    # Outer glow
-    for r in range(130+glow,80,-15):
-        alpha = int(40*(r-80)/(50+glow))
-        col = (255,240,100)
-        d.ellipse([cx-r,cy-r,cx+r,cy+r], fill=col)
-
-    # Moon body (crescent)
-    d.ellipse([cx-90,cy-90,cx+90,cy+90], fill=(255,230,50))
-    d.ellipse([cx+20,cy-80,cx+150,cy+80], fill=(50,30,150))  # cutout
-
-    # Stars around — drawn as shapes
+    glow = int(abs(math.sin(t * 1.5)) * 24)
+    for r in range(150+glow, 90, -18):
+        d.ellipse([cx-r, cy-r, cx+r, cy+r], fill=(255,240,100))
+    d.ellipse([cx-105, cy-105, cx+105, cy+105], fill=(255,230,50))
+    d.ellipse([cx+24,  cy-95,  cx+170, cy+95],  fill=(50,30,150))
+    face_x = cx - 18
+    blink = abs(math.sin(t * 0.7)) > 0.93
+    for xo in [-24, 18]:
+        ex2, ey2 = face_x+xo, cy-18
+        if blink: d.arc([ex2-12, ey2-5, ex2+12, ey2+5], 195, 345, fill=(80,50,10), width=5)
+        else:
+            d.ellipse([ex2-12, ey2-12, ex2+12, ey2+12], fill=(80,50,10))
+            d.ellipse([ex2-5,  ey2-10, ex2+1,  ey2-4],  fill=(255,255,255))
+    d.arc([face_x-22, cy+6, face_x+22, cy+34], 10, 170, fill=(180,100,30), width=5)
     for i in range(5):
-        angle = i/5*2*math.pi + t*0.5
-        sx2 = cx + int(130*math.cos(angle))
-        sy2 = cy + int(130*math.sin(angle))
-        # Draw 5-point star shape
+        ang = i/5*2*math.pi + t*0.5
+        sx2 = cx+int(155*math.cos(ang)); sy2 = cy+int(155*math.sin(ang))
         pts = []
         for j in range(10):
             a = j/10*2*math.pi - math.pi/2
-            dist = 18 if j%2==0 else 8
+            dist = 22 if j%2==0 else 10
             pts.append((sx2+int(dist*math.cos(a)), sy2+int(dist*math.sin(a))))
         d.polygon(pts, fill=(255,230,50))
 
-    # Face on moon
-    face_x = cx - 15
-    # Eyes
-    blink = abs(math.sin(t*0.7))>0.93
-    for xo in [-20,15]:
-        ex2,ey2 = face_x+xo, cy-15
-        if blink:
-            d.arc([ex2-10,ey2-4,ex2+10,ey2+4],195,345,fill=(80,50,10),width=4)
-        else:
-            d.ellipse([ex2-10,ey2-10,ex2+10,ey2+10],fill=(80,50,10))
-            d.ellipse([ex2-4,ey2-8,ex2+1,ey2-3],fill=(255,255,255))
-    # Smile
-    d.arc([face_x-18,cy+5,face_x+18,cy+28],10,170,fill=(180,100,30),width=4)
-
-def draw_horse(d, cx, cy, t):
-    """Cartoon horse — for Lakdi Ki Kathi"""
-    trot = int(math.sin(t*5)*18)
-    cx += int(math.sin(t*2)*15)
-    cy -= abs(trot)
-
-    col = (160,90,30)
-    dark = (120,60,15)
-
-    # Shadow
-    d.ellipse([cx-85,cy+155,cx+85,cy+178], fill=(0,0,0))
-
-    # Body
-    d.ellipse([cx-90,cy-90,cx+90,cy+60], fill=col)
-
-    # Head + neck
-    neck_pts = [(cx-30,cy-90),(cx+30,cy-90),(cx+45,cy-150),(cx-15,cy-160)]
-    d.polygon(neck_pts, fill=col)
-    d.ellipse([cx-50,cy-185,cx+40,cy-110], fill=col)
-
-    # Mane
-    for i in range(5):
-        mx = cx-20+i*10
-        my = cy-175+i*8
-        mw = int(math.sin(t*3+i)*6)
-        d.ellipse([mx-12+mw,my-18,mx+12+mw,my+18], fill=dark)
-
-    # Eye
-    d.ellipse([cx-35,cy-160,cx-10,cy-138], fill=(255,255,255))
-    d.ellipse([cx-30,cy-156,cx-16,cy-142], fill=(30,20,10))
-    d.ellipse([cx-28,cy-154,cx-23,cy-149], fill=(255,255,255))
-
-    # Nostril
-    d.ellipse([cx-20,cy-128,cx-5,cy-118], fill=dark)
-
-    # Ears
-    d.polygon([(cx-8,cy-188),(cx-25,cy-220),(cx+2,cy-215)], fill=col)
-    d.polygon([(cx-7,cy-190),(cx-20,cy-210),(cx+1,cy-207)], fill=(255,180,180))
-
-    # Legs — trotting
-    for i,(xo,phase) in enumerate([(-38,0),(38,1),(-25,1),(25,0)]):
-        lk2 = int(math.sin(t*5+phase*math.pi)*20)
-        d.rounded_rectangle([cx+xo-14,cy+50+lk2,cx+xo+14,cy+130+lk2],radius=8,fill=col)
-        d.ellipse([cx+xo-16,cy+118+lk2,cx+xo+16,cy+142+lk2],fill=dark)
-
-    # Tail
-    for i in range(6):
-        angle = i*0.2 - 0.5 + math.sin(t*3)*0.3
-        tx2 = cx+90+int(40*math.sin(angle+i*0.3))
-        ty2 = cy-20+i*20
-        d.ellipse([tx2-10,ty2-8,tx2+10,ty2+8], fill=dark)
 
 def draw_star_character(d, cx, cy, t):
-    """Twinkling star character — for Twinkle Twinkle"""
-    pulse = 1.0 + 0.15*math.sin(t*3)
-    r = int(100*pulse)
-    glow_r = r + 30
-
-    # Outer glow
-    glow_col = (255,240,100)
-    for gr in range(glow_r,r,-8):
-        fc = lerp_col(glow_col,(50,30,100),(gr-r)/30)
-        d.ellipse([cx-gr,cy-gr,cx+gr,cy+gr], fill=fc)
-
-    # Star shape — 5 points
+    pulse = 1.0 + 0.18*math.sin(t*3)
+    r = int(115*pulse)
+    for gr in range(r+36, r, -10):
+        fc = lerp_col((255,240,100), (50,30,100), (gr-r)/36)
+        d.ellipse([cx-gr, cy-gr, cx+gr, cy+gr], fill=fc)
     pts = []
     for i in range(10):
-        angle = i/10*2*math.pi - math.pi/2 + t*0.5
+        ang = i/10*2*math.pi - math.pi/2 + t*0.5
         dist = r if i%2==0 else r//2
-        pts.append((cx+int(dist*math.cos(angle)), cy+int(dist*math.sin(angle))))
+        pts.append((cx+int(dist*math.cos(ang)), cy+int(dist*math.sin(ang))))
     if pts: d.polygon(pts, fill=(255,235,50))
-
-    # Face
     blink = abs(math.sin(t*0.8))>0.93
-    for xo in [-22,22]:
-        ex2,ey2 = cx+xo, cy-8
-        if blink:
-            d.arc([ex2-12,ey2-4,ex2+12,ey2+4],195,345,fill=(100,70,0),width=4)
+    for xo in [-26, 26]:
+        ex2, ey2 = cx+xo, cy-9
+        if blink: d.arc([ex2-14, ey2-5, ex2+14, ey2+5], 195, 345, fill=(100,70,0), width=5)
         else:
-            d.ellipse([ex2-12,ey2-12,ex2+12,ey2+12],fill=(100,70,0))
-            d.ellipse([ex2-5,ey2-10,ex2+1,ey2-4],fill=(255,255,255))
-    d.arc([cx-15,cy+5,cx+15,cy+25],10,170,fill=(180,120,0),width=4)
-
-    # Sparkles around — drawn as 4-point stars
+            d.ellipse([ex2-14, ey2-14, ex2+14, ey2+14], fill=(100,70,0))
+            d.ellipse([ex2-6,  ey2-12, ex2+1,  ey2-5],  fill=(255,255,255))
+    d.arc([cx-18, cy+6, cx+18, cy+30], 10, 170, fill=(180,120,0), width=5)
     for i in range(6):
-        angle = i/6*2*math.pi + t*2
-        sx2 = cx+int((r+45)*math.cos(angle))
-        sy2 = cy+int((r+45)*math.sin(angle))
-        pts = []
+        ang = i/6*2*math.pi + t*2
+        sx2 = cx+int((r+55)*math.cos(ang)); sy2 = cy+int((r+55)*math.sin(ang))
+        pts2 = []
         for j in range(8):
             a = j/8*2*math.pi - math.pi/4
-            dist = 14 if j%2==0 else 5
-            pts.append((sx2+int(dist*math.cos(a)), sy2+int(dist*math.sin(a))))
-        d.polygon(pts, fill=(255,255,200))
+            dist = 16 if j%2==0 else 6
+            pts2.append((sx2+int(dist*math.cos(a)), sy2+int(dist*math.sin(a))))
+        d.polygon(pts2, fill=(255,255,200))
+
+
+def draw_horse(d, cx, cy, t):
+    trot = int(math.sin(t*5)*22); cx += int(math.sin(t*2)*18); cy -= abs(trot)
+    col=(160,90,30); dark=(120,60,15)
+    d.ellipse([cx-100, cy+165, cx+100, cy+192], fill=(30,20,10))
+    d.ellipse([cx-105, cy-105, cx+105, cy+72], fill=col)
+    d.polygon([(cx-36,cy-105),(cx+36,cy-105),(cx+54,cy-178),(cx-18,cy-190)], fill=col)
+    d.ellipse([cx-60, cy-220, cx+48,  cy-132], fill=col)
+    for i in range(5):
+        mx=cx-24+i*12; my=cy-210+i*10; mw=int(math.sin(t*3+i)*8)
+        d.ellipse([mx-14+mw, my-22, mx+14+mw, my+22], fill=dark)
+    d.ellipse([cx-42, cy-192, cx-12, cy-165], fill=(255,255,255))
+    d.ellipse([cx-36, cy-188, cx-18, cy-170], fill=(30,20,10))
+    d.ellipse([cx-24, cy-154, cx-6,  cy-142], fill=dark)
+    d.polygon([(cx-9,cy-225),(cx-30,cy-264),(cx+2,cy-258)], fill=col)
+    d.polygon([(cx-8,cy-228),(cx-24,cy-252),(cx+1,cy-248)], fill=(255,180,180))
+    for i,(xo,phase) in enumerate([(-46,0),(46,1),(-30,1),(30,0)]):
+        lk2=int(math.sin(t*5+phase*math.pi)*24)
+        d.rounded_rectangle([cx+xo-16,cy+60+lk2,cx+xo+16,cy+155+lk2],radius=10,fill=col)
+        d.ellipse([cx+xo-18,cy+142+lk2,cx+xo+18,cy+170+lk2],fill=dark)
+
 
 def draw_peacock(d, cx, cy, t):
-    """Peacock — for Nani Teri Morni"""
-    # Tail feathers spread
     for i in range(7):
-        angle = -math.pi/2 + (i-3)*0.28 + math.sin(t*1.5)*0.05
-        fl = 180 + int(math.sin(t*2+i)*10)
-        fx2 = cx + int(fl*math.cos(angle))
-        fy2 = cy - 60 + int(fl*math.sin(angle))
+        ang = -math.pi/2 + (i-3)*0.3 + math.sin(t*1.5)*0.06
+        fl = 210 + int(math.sin(t*2+i)*12)
+        fx2 = cx+int(fl*math.cos(ang)); fy2 = cy-72+int(fl*math.sin(ang))
         col = [(0,180,100),(0,150,200),(100,50,200),(0,200,150)][i%4]
-        d.line([(cx,cy-60),(fx2,fy2)], fill=col, width=10)
-        d.ellipse([fx2-20,fy2-20,fx2+20,fy2+20], fill=col)
-        d.ellipse([fx2-10,fy2-10,fx2+10,fy2+10], fill=(0,0,80))
-        d.ellipse([fx2-5,fy2-5,fx2+5,fy2+5], fill=(100,200,255))
-
-    # Body
-    d.ellipse([cx-45,cy-80,cx+45,cy+50], fill=(0,150,100))
-    # Head
-    d.ellipse([cx-28,cy-125,cx+28,cy-65], fill=(0,150,100))
-    # Crest
+        d.line([(cx,cy-72),(fx2,fy2)], fill=col, width=12)
+        d.ellipse([fx2-24,fy2-24,fx2+24,fy2+24], fill=col)
+        d.ellipse([fx2-12,fy2-12,fx2+12,fy2+12], fill=(0,0,80))
+        d.ellipse([fx2-6, fy2-6, fx2+6, fy2+6],  fill=(100,200,255))
+    d.ellipse([cx-54, cy-96, cx+54, cy+60],  fill=(0,150,100))
+    d.ellipse([cx-34, cy-150, cx+34, cy-78], fill=(0,150,100))
     for i in range(3):
-        d.line([(cx-8+i*8,cy-125),(cx-12+i*8,cy-155)],fill=(0,200,150),width=5)
-        d.ellipse([cx-16+i*8,cy-163,cx-4+i*8,cy-151],fill=(0,200,150))
+        d.line([(cx-10+i*10,cy-150),(cx-14+i*10,cy-186)],fill=(0,200,150),width=6)
+        d.ellipse([cx-19+i*10,cy-198,cx-5+i*10,cy-183],fill=(0,200,150))
+    d.ellipse([cx-14,cy-126,cx+14,cy-100],fill=(255,240,200))
+    d.ellipse([cx-8, cy-122,cx+8, cy-106],fill=(20,15,5))
 
-    # Eye
-    d.ellipse([cx-12,cy-105,cx+12,cy-83], fill=(255,240,200))
-    d.ellipse([cx-7,cy-101,cx+7,cy-87], fill=(20,15,5))
-    d.ellipse([cx-5,cy-99,cx+0,cy-94], fill=(255,255,255))
-
-def draw_butterfly(d, cx, cy, t):
-    """Butterfly — for Titli"""
-    flap = math.sin(t*4)
-    wing_open = abs(flap)
-
-    colors = [(255,100,200),(100,200,255),(255,200,50),(200,100,255)]
-
-    # Wings
-    for side,sign in [("left",-1),("right",1)]:
-        wx = cx + sign*int(120*wing_open)
-        # Upper wing
-        d.ellipse([cx+sign*10-60,cy-120,wx+sign*20,cy-10], fill=colors[0 if side=="left" else 1])
-        # Lower wing
-        d.ellipse([cx+sign*10-50,cy-20,wx+sign*10,cy+90],  fill=colors[2 if side=="left" else 3])
-
-    # Body
-    d.ellipse([cx-12,cy-110,cx+12,cy+70], fill=(60,30,10))
-    # Head
-    d.ellipse([cx-14,cy-130,cx+14,cy-100], fill=(80,50,20))
-    # Antennae
-    for sign in [-1,1]:
-        d.line([(cx,cy-128),(cx+sign*30,cy-170)],fill=(60,30,10),width=4)
-        d.ellipse([cx+sign*26,cy-178,cx+sign*38,cy-166],fill=(255,150,50))
-
-    # Eye
-    d.ellipse([cx-7,cy-122,cx+7,cy-110],fill=(255,255,255))
-    d.ellipse([cx-4,cy-120,cx+4,cy-112],fill=(20,15,5))
 
 def draw_kid_character(d, cx, cy, t):
-    """Generic cute kid — default fallback"""
-    bounce = int(abs(math.sin(t*3.2))*22)
-    cy -= bounce
-
-    skin = (255,220,177)
-    shirt = (255,100,100)
-
-    d.ellipse([cx-60,cy+105,cx+60,cy+125], fill=(0,0,0))
-    d.rounded_rectangle([cx-72,cy-85,cx+72,cy+10], radius=20, fill=shirt)
-    d.ellipse([cx-22,cy-85+5,cx+22,cy-85+30], fill=skin)
-
-    pants = (70,100,180)
-    d.rounded_rectangle([cx-62,cy-20,cx+62,cy+110], radius=12, fill=pants)
-    d.rectangle([cx-5,cy+10,cx+5,cy+110], fill=tuple(max(0,c-30) for c in pants))
-
-    shoe = (60,40,20)
-    lk = int(math.sin(t*3.2)*8)
-    d.ellipse([cx-62,cy+85+lk, cx-10,cy+120+lk],  fill=shoe)
-    d.ellipse([cx+10,cy+85-lk, cx+62,cy+120-lk],  fill=shoe)
-
-    hr = 82
-    hx,hy = cx, cy-85-hr+18
-    d.ellipse([hx-hr+6,hy-hr+6,hx+hr+6,hy+hr+6], fill=(0,0,0))
-    d.ellipse([hx-hr,hy-hr,hx+hr,hy+hr], fill=skin)
-
-    hair = (80,50,20)
-    d.ellipse([hx-hr,hy-hr,hx+hr,hy-10], fill=hair)
-    d.ellipse([hx-hr-10,hy-hr+30,hx-hr+25,hy-hr+70], fill=hair)
-    d.ellipse([hx+hr-25,hy-hr+30,hx+hr+10,hy-hr+70], fill=hair)
-
+    bounce = int(abs(math.sin(t*3.2))*26); cy -= bounce
+    skin=(255,220,177); shirt=(255,100,100)
+    d.ellipse([cx-72, cy+126, cx+72, cy+150], fill=(30,20,10))
+    d.rounded_rectangle([cx-86, cy-102, cx+86, cy+12], radius=24, fill=shirt)
+    d.ellipse([cx-26, cy-98, cx+26, cy-66], fill=skin)
+    pants=(70,100,180)
+    d.rounded_rectangle([cx-74, cy-24, cx+74, cy+132], radius=14, fill=pants)
+    d.rectangle([cx-6, cy+12, cx+6, cy+132], fill=tuple(max(0,c-30) for c in pants))
+    shoe=(60,40,20); lk=int(math.sin(t*3.2)*10)
+    d.ellipse([cx-74, cy+102+lk,  cx-12, cy+144+lk],  fill=shoe)
+    d.ellipse([cx+12, cy+102-lk,  cx+74, cy+144-lk],  fill=shoe)
+    hr=98; hx,hy = cx, cy-102-hr+22
+    d.ellipse([hx-hr+7, hy-hr+7, hx+hr+7, hy+hr+7], fill=(20,15,10))
+    d.ellipse([hx-hr, hy-hr, hx+hr, hy+hr], fill=skin)
+    hair=(80,50,20)
+    d.ellipse([hx-hr, hy-hr, hx+hr, hy-12], fill=hair)
+    d.ellipse([hx-hr-12, hy-hr+36, hx-hr+30, hy-hr+84], fill=hair)
+    d.ellipse([hx+hr-30, hy-hr+36, hx+hr+12, hy-hr+84], fill=hair)
     blink = abs(math.sin(t*0.7))>0.92
-    for xo in [-28,28]:
-        ex2,ey2 = hx+xo, hy-10
-        if blink:
-            d.arc([ex2-18,ey2-6,ex2+18,ey2+6],185,355,fill=(50,30,20),width=5)
+    for xo in [-34, 34]:
+        ex2, ey2 = hx+xo, hy-12
+        if blink: d.arc([ex2-22, ey2-7, ex2+22, ey2+7], 185, 355, fill=(50,30,20), width=6)
         else:
-            d.ellipse([ex2-18,ey2-18,ex2+18,ey2+18],fill=(255,255,255))
-            d.ellipse([ex2-11,ey2-12,ex2+11,ey2+12],fill=(80,50,200))
-            d.ellipse([ex2-7,ey2-8,ex2+7,ey2+8],fill=(20,15,10))
-            d.ellipse([ex2-4,ey2-10,ex2+1,ey2-5],fill=(255,255,255))
+            d.ellipse([ex2-22, ey2-22, ex2+22, ey2+22], fill=(255,255,255))
+            d.ellipse([ex2-13, ey2-15, ex2+13, ey2+15], fill=(80,50,200))
+            d.ellipse([ex2-8,  ey2-9,  ex2+8,  ey2+9],  fill=(20,15,10))
+            d.ellipse([ex2-5,  ey2-12, ex2+1,  ey2-6],  fill=(255,255,255))
+    d.ellipse([hx-10, hy+6, hx+10, hy+22], fill=tuple(max(0,c-30) for c in skin))
+    sy2=int(math.sin(t*2)*2)
+    d.arc([hx-26, hy+14+sy2, hx+26, hy+46+sy2], 15, 165, fill=(180,60,80), width=6)
+    for cxo in [-50, 50]:
+        d.ellipse([hx+cxo-24, hy+6, hx+cxo+24, hy+36], fill=(255,160,160))
+    aw_l=math.sin(t*3.5)*54; aw_r=math.sin(t*3.5+math.pi)*54
+    d.line([cx-86, cy-60, cx-158, cy-90-int(aw_l)], fill=shirt, width=34)
+    d.ellipse([cx-178, cy-108-int(aw_l)-22, cx-140, cy-108-int(aw_l)+22], fill=skin)
+    d.line([cx+86, cy-60, cx+158, cy-90-int(aw_r)], fill=shirt, width=34)
+    d.ellipse([cx+140, cy-108-int(aw_r)-22, cx+178, cy-108-int(aw_r)+22], fill=skin)
 
-    d.ellipse([hx-8,hy+5,hx+8,hy+18],fill=tuple(max(0,c-25) for c in skin))
-    sy2 = int(math.sin(t*2)*2)
-    d.arc([hx-22,hy+12+sy2,hx+22,hy+38+sy2],15,165,fill=(180,60,80),width=5)
-    d.arc([hx-18,hy+14+sy2,hx+18,hy+35+sy2],20,160,fill=(255,250,250),width=8)
-    for cx2o in [-42,42]:
-        d.ellipse([hx+cx2o-20,hy+5,hx+cx2o+20,hy+30],fill=(255,160,160))
 
-    aw_l = math.sin(t*3.5)*45
-    aw_r = math.sin(t*3.5+math.pi)*45
-    d.line([cx-72,cy-50,cx-132,cy-75-int(aw_l)],fill=shirt,width=28)
-    d.ellipse([cx-148,cy-90-int(aw_l)-18,cx-118,cy-90-int(aw_l)+18],fill=skin)
-    d.line([cx+72,cy-50,cx+132,cy-75-int(aw_r)],fill=shirt,width=28)
-    d.ellipse([cx+118,cy-90-int(aw_r)-18,cx+148,cy-90-int(aw_r)+18],fill=skin)
-
-# Character dispatcher
 CHAR_FUNCS = {
     "cat":       draw_cat,
     "fish":      draw_fish,
@@ -698,196 +407,132 @@ CHAR_FUNCS = {
     "star":      draw_star_character,
     "horse":     draw_horse,
     "peacock":   draw_peacock,
-    "butterfly": draw_butterfly,
     "kid":       draw_kid_character,
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  WORD-BY-WORD KARAOKE
+#  KARAOKE — clean word-by-word
 # ══════════════════════════════════════════════════════════════════════════════
 
-def strip_non_renderable(text):
-    """Remove emojis and non-Hindi/ASCII chars that cause boxes"""
-    import re as _re
-    # Keep: ASCII + Devanagari (Hindi) + spaces + punctuation
-    clean = _re.sub(r"[^-ऀ-ॿ\s\|\-\.\,\!\?]", "", text)
-    return clean.strip() or text[:20]
-
-def draw_karaoke_v3(d, lines_data, current_idx, t, bg_col1, emojis):
-    """Word-by-word karaoke — centered, clean Hindi text"""
-    th_accent = bg_col1
-
-    # Parse accent color
-    if isinstance(th_accent, str):
-        acc = tuple(int(th_accent.lstrip("#")[i:i+2],16) for i in (0,2,4))
-    else:
-        acc = th_accent
-
+def draw_karaoke_v3(d, lines_data, current_idx, t, accent):
     slots = []
-    if current_idx > 0:      slots.append((current_idx-1, False))
+    if current_idx > 0:                      slots.append((current_idx-1, False))
     slots.append((current_idx, True))
-    if current_idx < len(lines_data)-1: slots.append((current_idx+1, False))
+    if current_idx < len(lines_data)-1:      slots.append((current_idx+1, False))
 
-    n = len(slots)
-    spacing = 185
-    # Center the slots in lower half of screen
-    center_y = int(H * 0.60)
-    base_y = center_y - spacing*(n-1)//2
+    spacing = 195
+    center_y = int(H * 0.38)
+    base_y = center_y - spacing * (len(slots)-1) // 2
 
     for i, (li, is_active) in enumerate(slots):
         if li < 0 or li >= len(lines_data): continue
-        raw_text = lines_data[li]["text"]
-        text = strip_non_renderable(raw_text)
-        y = base_y + i*spacing
+        text = lines_data[li]["text"]
+        y = base_y + i * spacing
 
         if is_active:
-            fnt_size = 88
-            fnt = get_font(fnt_size, bold=True)
-
-            # Word-by-word progress
+            fnt = get_font(88, bold=True)
             line_dur = max(0.1, lines_data[li]["end"] - lines_data[li]["start"])
-            prog = (t - lines_data[li]["start"]) / line_dur
-            prog = max(0, min(1, prog))
+            prog = max(0, min(1, (t - lines_data[li]["start"]) / line_dur))
             words = text.split()
             n_words = max(len(words), 1)
-            words_shown = max(1, int(prog * (n_words + 0.5)))
-            shown_text = " ".join(words[:min(words_shown, n_words)])
+            shown = " ".join(words[:max(1, int(prog * (n_words + 0.5)))])
 
-            # Measure full text for pill width (stays constant)
             try:
-                bb_full = d.textbbox((0,0), text, font=fnt)
-                full_w  = bb_full[2] - bb_full[0]
-                lh      = bb_full[3] - bb_full[1]
-                bb_show = d.textbbox((0,0), shown_text, font=fnt)
-                show_w  = bb_show[2] - bb_show[0]
+                bb = d.textbbox((0,0), text, font=fnt)
+                fw = min(bb[2]-bb[0], W-100); lh = bb[3]-bb[1]
+                bb2 = d.textbbox((0,0), shown, font=fnt)
+                sw = bb2[2]-bb2[0]
             except:
-                full_w = max(len(text)*48, 300)
-                show_w = full_w
-                lh     = fnt_size
+                fw=600; sw=300; lh=88
 
-            # Clamp pill width so it never goes off screen
-            max_w   = W - 80
-            full_w  = min(full_w, max_w)
-            pad     = 36
-
-            # Pill centered on screen
-            pill_x1 = (W - full_w) // 2 - pad
-            pill_x2 = (W + full_w) // 2 + pad
-            pill_y1 = y - 18
-            pill_y2 = y + lh + 18
-
-            # White semi-transparent pill
-            pill_col = (255, 255, 255)
-            d.rounded_rectangle([pill_x1, pill_y1, pill_x2, pill_y2],
-                                  radius=28, fill=pill_col)
-            # Accent border
-            d.rounded_rectangle([pill_x1, pill_y1, pill_x2, pill_y2],
-                                  radius=28, outline=acc, width=4)
-
-            # Text centered in pill — dark color on white bg
-            txt_x = (W - show_w) // 2
-            # Shadow
-            d.text((txt_x+2, y+2), shown_text, fill=(180,180,180), font=fnt)
-            # Main text in accent/dark color
-            txt_col = tuple(max(0, c-60) for c in acc) if sum(acc) > 400 else acc
-            d.text((txt_x, y), shown_text, fill=txt_col, font=fnt)
+            pad=42
+            x1=(W-fw)//2-pad; x2=(W+fw)//2+pad
+            # Pill shadow
+            d.rounded_rectangle([x1+5, y-20+5, x2+5, y+lh+20+5], radius=32, fill=(160,160,160))
+            # White pill
+            d.rounded_rectangle([x1, y-20, x2, y+lh+20], radius=32, fill=(255,255,255))
+            d.rounded_rectangle([x1, y-20, x2, y+lh+20], radius=32, outline=accent, width=5)
+            # Text
+            tx = (W-sw)//2
+            d.text((tx, y), shown, fill=tuple(max(0,c-40) for c in accent), font=fnt)
 
         else:
-            fnt_size = 56
-            fnt = get_font(fnt_size, bold=False)
+            fnt = get_font(58, bold=False)
             try:
-                bb  = d.textbbox((0,0), text, font=fnt)
-                lw  = bb[2] - bb[0]
-                lh  = bb[3] - bb[1]
-            except:
-                lw = len(text)*30; lh = fnt_size
+                bb = d.textbbox((0,0), text, font=fnt)
+                lw = min(bb[2]-bb[0], W-80); lh = bb[3]-bb[1]
+            except: lw=460; lh=58
+            tx = (W-lw)//2
+            d.rounded_rectangle([tx-18, y-12, tx+lw+18, y+lh+12], radius=16, fill=(0,0,0))
+            d.text((tx, y), text, fill=(215,205,240), font=fnt)
 
-            lw = min(lw, W-60)
-            txt_x = (W - lw) // 2
 
-            # Semi-transparent dark pill for dim lines
-            d.rounded_rectangle([txt_x-16, y-10, txt_x+lw+16, y+lh+10],
-                                  radius=14, fill=(0,0,0))
-            # Dim white text
-            d.text((txt_x+1, y+1), text, fill=(0,0,0),       font=fnt)
-            d.text((txt_x,   y),   text, fill=(210,205,230),  font=fnt)
-
-def draw_title_v3(d, title, accent_col):
+def draw_title_v3(d, title, accent):
     if not title: return
-    # Strip emojis — PIL on Linux cant render them
-    import re as _re
-    clean_title = _re.sub(r"[^\u0000-\u007F\u0900-\u097F\u0A00-\u0A7F\s]", "", title).strip()
-    if not clean_title: clean_title = title[:20]
-    fnt = get_font(54, bold=True)
+    clean = re.sub(r"[^\u0000-\u007F\u0900-\u097F\s\|\-\.\,]", "", title).strip()
+    if not clean: clean = title[:30]
+    fnt = get_font(52, bold=True)
     try:
-        bb = d.textbbox((0,0),clean_title,font=fnt)
-        tw = bb[2]-bb[0]
-    except: tw=len(clean_title)*32
-    tw = max(tw, 200)
+        bb = d.textbbox((0,0), clean, font=fnt); tw = bb[2]-bb[0]
+    except: tw = len(clean)*32
+    tw = max(tw, 180)
     tx = (W-tw)//2
-    d.rounded_rectangle([tx-22,52,tx+tw+22,122], radius=18, fill=(0,0,0))
-    d.rounded_rectangle([tx-20,54,tx+tw+20,120], radius=16,
-                         fill=tuple(min(255,c+30) for c in accent_col))
-    d.text((tx+2,62), clean_title, fill=(0,0,0), font=fnt)
-    d.text((tx,  60), clean_title, fill=(255,255,255), font=fnt)
+    # Shadow
+    d.rounded_rectangle([tx-26+4, 50+4, tx+tw+26+4, 122+4], radius=20, fill=(100,100,100))
+    # Bg
+    d.rounded_rectangle([tx-26, 50, tx+tw+26, 122], radius=20, fill=accent)
+    d.text((tx+2, 60), clean, fill=(0,0,0), font=fnt)
+    d.text((tx,   58), clean, fill=(255,255,255), font=fnt)
+
 
 def draw_progress_v3(d, progress, col1, col2):
-    bh = 16
-    d.rectangle([0,H-bh,W,H], fill=(25,25,25))
+    bh=18
+    d.rectangle([0, H-bh, W, H], fill=(25,25,25))
     fw = int(W*progress)
     if fw > 2:
         for x in range(fw):
             col = lerp_col(col1, col2, x/W)
             d.line([(x,H-bh),(x,H)], fill=col)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MASTER RENDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_frame_v3(lines_data, current_line_idx, fi, total_frames,
-                    story_cfg, title=""):
-    """
-    story_cfg = from get_story_config()
-    """
+def render_frame_v3(lines_data, current_line_idx, fi, total_frames, story_cfg, title=""):
     t = fi / FPS
     progress = fi / max(total_frames, 1)
 
-    _, col1, col2 = story_cfg["bg"]
-    emojis = story_cfg["emojis"]
-    char_name = story_cfg["char"]
-
-    # Parse accent color from col1
-    accent = tuple(int(col1.lstrip('#')[i:i+2],16) for i in (0,2,4))
+    col1, col2 = story_cfg["bg"]
+    dot_col    = story_cfg.get("dot_col", col1)
+    char_name  = story_cfg["char"]
+    accent     = hex_to_rgb(col1)
 
     img = Image.new("RGB", (W, H), (20,20,40))
     d   = ImageDraw.Draw(img)
 
-    # 1. Background gradient
+    # 1. Background
     draw_bg(d, col1, col2, t)
 
-    # 2. Night theme gets stars
-    if "night" in story_cfg["bg"][0].lower() or "space" in story_cfg["bg"][0].lower():
-        draw_stars(d, t)
+    # 2. Stars for dark themes, subtle dots for light themes
+    is_dark = any(k in story_cfg.get("bg",("",""))[0] for k in ["#0","#1","#2","#3"])
+    if is_dark:
+        draw_stars_bg(d, t)
     else:
-        draw_bokeh(d, [accent, (255,255,255), tuple(min(255,c+80) for c in accent)], t)
+        draw_subtle_bokeh(d, dot_col, t)
 
-    # 3. Floating emojis
-    draw_floating_emojis(d, emojis, t)
-
-    # 4. Title
+    # 3. Title
     draw_title_v3(d, title, accent)
 
-    # 5. Story-matched character — bottom right
+    # 4. Character — big, centered horizontally, lower portion
     char_fn = CHAR_FUNCS.get(char_name, draw_kid_character)
-    char_x = int(W * 0.72)
-    char_y = int(H * 0.80)
-    char_fn(d, char_x, char_y, t)
+    char_fn(d, W//2, int(H * 0.76), t)
 
-    # 6. Karaoke
+    # 5. Karaoke — above character
     if lines_data:
-        draw_karaoke_v3(d, lines_data, current_line_idx, t, accent, emojis)
+        draw_karaoke_v3(d, lines_data, current_line_idx, t, accent)
 
-    # 7. Progress bar
-    draw_progress_v3(d, progress, accent, (255,200,80))
+    # 6. Progress bar
+    draw_progress_v3(d, progress, accent, (255, 200, 80))
 
     return img
