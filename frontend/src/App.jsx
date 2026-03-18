@@ -84,6 +84,14 @@ export default function App() {
   const [uploading, setUploading]     = useState(false)
   const fileRef = useRef()
 
+  // Background image upload
+  const [bgImages, setBgImages]               = useState([])
+  const [bgImgFile, setBgImgFile]             = useState(null)
+  const [bgImgMsg, setBgImgMsg]               = useState("")
+  const [bgImgUploading, setBgImgUploading]   = useState(false)
+  const [selectedBgImgs, setSelectedBgImgs]   = useState([])
+  const bgImgRef = useRef()
+
   // Job state
   const [jobId, setJobId] = useState(null)
   const [job, setJob]     = useState(null)
@@ -96,11 +104,16 @@ export default function App() {
   useEffect(()=>{
     fetch(`${API}/api/builtins`).then(r=>r.json()).then(setBlt).catch(()=>{})
     refreshSongs()
+    refreshBgImages()
     fetch(`${API}/api/health`).then(r=>r.json()).then(setHealth).catch(()=>{})
   },[])
 
   const refreshSongs = () => {
     fetch(`${API}/api/songs`).then(r=>r.json()).then(setSongs).catch(()=>{})
+  }
+
+  const refreshBgImages = () => {
+    fetch(`${API}/api/bg-images`).then(r=>r.json()).then(setBgImages).catch(()=>{})
   }
 
   useEffect(()=>{
@@ -136,6 +149,31 @@ export default function App() {
     setUploading(false)
   }
 
+  const handleBgImageUpload = async () => {
+    if (!bgImgFile) return alert("Pehle image file chuniye!")
+    setBgImgUploading(true); setBgImgMsg("⏳ Upload ho raha hai...")
+    const fd = new FormData()
+    fd.append("file", bgImgFile)
+    try {
+      const data = await fetch(`${API}/api/upload-bg-image`,{method:"POST",body:fd}).then(r=>r.json())
+      if (data.ok) {
+        setBgImgMsg(`✅ ${data.filename} upload hua! (${data.size_kb}KB)`)
+        setBgImgFile(null)
+        if (bgImgRef.current) bgImgRef.current.value=""
+        refreshBgImages()
+        // auto-select the newly uploaded image
+        setSelectedBgImgs(s => s.includes(data.filename) ? s : [...s, data.filename])
+      } else { setBgImgMsg(`❌ ${data.error}`) }
+    } catch { setBgImgMsg("❌ Upload fail — server chal raha hai?") }
+    setBgImgUploading(false)
+  }
+
+  const deleteBgImage = async (fname) => {
+    await fetch(`${API}/api/delete-bg-image/${fname}`,{method:"DELETE"})
+    setSelectedBgImgs(s => s.filter(x => x !== fname))
+    refreshBgImages()
+  }
+
   const deleteSong = async (fname) => {
     if (!confirm(`'${fname}' delete karna hai?`)) return
     await fetch(`${API}/api/delete-song/${fname}`,{method:"DELETE"})
@@ -164,6 +202,7 @@ export default function App() {
       body.bg_key        = customSong.bg_key
       // song_key is what maps to the MP3 file
       body.builtin_key   = customSong.song_key || customSong.bg_key
+      if (selectedBgImgs.length > 0) body.bg_image_keys = selectedBgImgs
     } else { return }
 
     setJob(null)
@@ -318,6 +357,102 @@ export default function App() {
                                background:found.preview, opacity:0.8}} />
                 ) : null
               })()}
+            </div>
+
+            {/* ═══ BACKGROUND IMAGES — for songs/slow videos ═══ */}
+            <div style={{marginBottom:12, background:"rgba(255,255,255,0.03)", borderRadius:12,
+                         padding:12, border:"1px solid rgba(167,139,250,0.25)"}}>
+              <Label>
+                🖼️ Custom Background Images{" "}
+                <span style={{color:"#444",fontWeight:400}}>
+                  (optional — song videos ke liye, 2-3 images dalo, Ken Burns effect aayega)
+                </span>
+              </Label>
+
+              {/* Upload row */}
+              <div style={{display:"flex", gap:8, marginTop:8, alignItems:"center", flexWrap:"wrap"}}>
+                <input ref={bgImgRef} type="file" accept=".jpg,.jpeg,.png,.webp"
+                  onChange={e=>{ setBgImgFile(e.target.files?.[0]||null); setBgImgMsg("") }}
+                  style={{...inp, flex:1, minWidth:0, cursor:"pointer", padding:"8px 12px", fontSize:12}} />
+                <button onClick={handleBgImageUpload} disabled={bgImgUploading||!bgImgFile}
+                  style={{padding:"9px 16px", borderRadius:10, border:"none", whiteSpace:"nowrap",
+                          cursor:bgImgUploading||!bgImgFile?"not-allowed":"pointer",
+                          background:bgImgUploading||!bgImgFile
+                            ?"rgba(100,100,100,0.3)"
+                            :"linear-gradient(135deg,#a78bfa,#7c3aed)",
+                          color:"#fff", fontWeight:700, fontSize:13}}>
+                  {bgImgUploading?"⏳":"⬆️ Upload"}
+                </button>
+              </div>
+              {bgImgMsg && (
+                <div style={{fontSize:12, marginTop:6,
+                             color:bgImgMsg.startsWith("✅")?"#06d6a0":bgImgMsg.startsWith("❌")?"#ff8080":"#aaa"}}>
+                  {bgImgMsg}
+                </div>
+              )}
+
+              {/* Uploaded images grid — tap to select/deselect */}
+              {bgImages.length > 0 && (
+                <div style={{marginTop:10}}>
+                  <div style={{fontSize:11, color:"#555", marginBottom:6}}>
+                    👇 Images tap karo select karne ke liye (jo ✓ hain, video mein use hongi)
+                    {selectedBgImgs.length > 0 &&
+                      <span style={{color:"#a78bfa",fontWeight:700}}>
+                        {" "}— {selectedBgImgs.length} selected
+                      </span>}
+                  </div>
+                  <div style={{display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:6}}>
+                    {bgImages.map(img => {
+                      const sel2 = selectedBgImgs.includes(img.filename)
+                      return (
+                        <div key={img.filename}
+                          style={{position:"relative", borderRadius:8, overflow:"hidden",
+                                  border:`2px solid ${sel2?"#a78bfa":"rgba(255,255,255,0.1)"}`,
+                                  cursor:"pointer"}}
+                          onClick={()=>
+                            setSelectedBgImgs(s =>
+                              s.includes(img.filename)
+                                ? s.filter(x=>x!==img.filename)
+                                : [...s, img.filename]
+                            )
+                          }>
+                          <img
+                            src={`${API}/api/bg-image/${img.filename}`}
+                            alt={img.filename}
+                            style={{width:"100%", aspectRatio:"9/16", objectFit:"cover",
+                                    display:"block", filter:sel2?"brightness(1)":"brightness(0.5)"}} />
+                          {sel2 && (
+                            <div style={{position:"absolute",top:4,right:4,
+                                         background:"#a78bfa",borderRadius:"50%",
+                                         width:22,height:22,display:"flex",
+                                         alignItems:"center",justifyContent:"center",
+                                         fontSize:13,fontWeight:900}}>✓</div>
+                          )}
+                          <button
+                            onClick={e=>{ e.stopPropagation(); deleteBgImage(img.filename) }}
+                            style={{position:"absolute",top:4,left:4,background:"rgba(255,50,50,0.75)",
+                                    border:"none",borderRadius:6,padding:"2px 6px",
+                                    color:"#fff",fontSize:11,cursor:"pointer"}}>
+                            🗑️
+                          </button>
+                          <div style={{position:"absolute",bottom:0,left:0,right:0,
+                                       background:"rgba(0,0,0,0.55)",fontSize:9,
+                                       color:"#ccc",padding:"3px 5px",
+                                       overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                            {img.filename}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {bgImages.length === 0 && (
+                <div style={{fontSize:12,color:"#444",marginTop:8,textAlign:"center",padding:"8px 0"}}>
+                  Koi image nahi — JPG/PNG upload karo 👆
+                </div>
+              )}
             </div>
 
             {/* ═══ SONG SELECTION — separate from theme ═══ */}

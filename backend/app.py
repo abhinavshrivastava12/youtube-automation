@@ -35,9 +35,12 @@ FPS     = 30
 FFMPEG  = shutil.which("ffmpeg")  or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
 
-SONGS_DIR    = os.path.join(_here, "songs")
-MAPPING_FILE = os.path.join(_here, "song_mapping.json")
-os.makedirs(SONGS_DIR, exist_ok=True)
+SONGS_DIR      = os.path.join(_here, "songs")
+MAPPING_FILE   = os.path.join(_here, "song_mapping.json")
+BG_IMAGES_DIR  = os.path.join(_here, "bg_images")
+os.makedirs(SONGS_DIR,     exist_ok=True)
+os.makedirs(BG_IMAGES_DIR, exist_ok=True)
+_bg_img_cache = {}   # path → pre-scaled PIL Image
 
 jobs = {}
 GROQ_KEY   = os.getenv("GROQ_API_KEY", "")
@@ -246,6 +249,220 @@ def draw_lofi_bg(d, col1, col2, accent_rgb, t):
         gy = int(H * 0.35 + math.sin(t * 0.5 + i) * 30)
         gr = 35 + i * 10
         d.ellipse([gx-gr, gy-gr, gx+gr, gy+gr], fill=accent_rgb)
+
+# ── Ken Burns background image support ───────────────────────────────────────
+_KEN_DIRS = [
+    (0.0, 0.0, 1.0, 0.3),   # pan right + slight down
+    (1.0, 0.3, 0.0, 0.0),   # pan left + slight up
+    (0.2, 0.0, 0.8, 1.0),   # diagonal: top-left → bottom-right
+    (0.8, 1.0, 0.2, 0.0),   # diagonal: bottom-right → top-left
+]
+
+def _load_and_scale_bg(path):
+    """Load, scale, and cache a background image. Scales to cover 1080×1920 + 15% pan room."""
+    if path in _bg_img_cache:
+        return _bg_img_cache[path]
+    try:
+        bg = Image.open(path).convert("RGB")
+    except Exception as e:
+        print(f"[BG] Cannot load {path}: {e}")
+        _bg_img_cache[path] = None
+        return None
+    bw, bh = bg.size
+    scale = max(W * 1.15 / bw, H * 1.15 / bh)
+    new_w = max(W + 2, int(bw * scale))
+    new_h = max(H + 2, int(bh * scale))
+    bg = bg.resize((new_w, new_h), Image.LANCZOS)
+    _bg_img_cache[path] = bg
+    print(f"[BG] Loaded+cached: {os.path.basename(path)} → {new_w}×{new_h}")
+    return bg
+
+def _draw_bg_image_kenburns(img_canvas, fi, total_frames, bg_paths):
+    """
+    Ken Burns effect: each image shown for equal time, slow pan per image,
+    crossfade in last 15% of each segment. 40% dark overlay for readability.
+    """
+    n = len(bg_paths)
+    seg   = max(1.0, total_frames / n)
+    i_idx = min(int(fi / seg), n - 1)
+    n_idx = (i_idx + 1) % n
+    seg_p = (fi % seg) / max(seg, 1)   # 0→1 within segment
+
+    def get_frame(path, prog, dir_idx):
+        base = _load_and_scale_bg(path)
+        if base is None:
+            return Image.new("RGB", (W, H), (10, 10, 20))
+        bw, bh = base.size
+        px = max(0, bw - W)
+        py = max(0, bh - H)
+        dx0, dy0, dx1, dy1 = _KEN_DIRS[dir_idx % len(_KEN_DIRS)]
+        cx = int(px * (dx0 + (dx1 - dx0) * prog))
+        cy = int(py * (dy0 + (dy1 - dy0) * prog))
+        cx = max(0, min(px, cx))
+        cy = max(0, min(py, cy))
+        frame = base.crop((cx, cy, cx + W, cy + H))
+        dark  = Image.new("RGB", (W, H), (0, 0, 0))
+        return Image.blend(frame, dark, 0.40)   # 40% dark overlay
+
+    cur_frame = get_frame(bg_paths[i_idx], seg_p, i_idx)
+
+    if seg_p > 0.85 and n > 1:                 # crossfade last 15%
+        blend_t = (seg_p - 0.85) / 0.15
+        nxt     = get_frame(bg_paths[n_idx], 0.0, n_idx)
+        cur_frame = Image.blend(cur_frame, nxt, blend_t)
+
+    img_canvas.paste(cur_frame, (0, 0))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SONG OVERLAY ANIMATIONS — drawn ON TOP of bg image (Ken Burns)
+#  These 4 layers are always stacked together for song videos
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _song_bokeh_orbs(d, accent_rgb, t):
+    """
+    8 slow-drifting glowing orbs — each a soft radial blob.
+    Colours: accent + white + warm gold mix.
+    """
+    rng  = random.Random(7)
+    cols = [
+        accent_rgb,
+        tuple(min(255, c + 90) for c in accent_rgb),
+        (255, 230, 120),   # warm gold
+        (255, 255, 255),   # white
+        tuple(max(0, c - 40) for c in accent_rgb),
+    ]
+    for i in range(8):
+        r    = rng.randint(28, 80)
+        sx   = rng.uniform(0.05, 0.95) * W
+        sy   = rng.uniform(0.05, 0.85) * H
+        spd  = rng.uniform(8, 22)
+        ph   = rng.random() * math.pi * 2
+        col  = cols[i % len(cols)]
+
+        # Gentle Lissajous drift
+        cx2  = int((sx + math.sin(t * 0.35 + ph)       * 70) % W)
+        cy2  = int((sy + math.sin(t * 0.22 + ph * 1.3) * 50) % H)
+
+        # Pulse radius slightly
+        pr = r + int(math.sin(t * 1.8 + ph) * 10)
+
+        # Draw 3-layer soft blob: outer dim, mid, inner bright
+        for layer_r, alpha_frac in [(pr, 0.12), (pr*2//3, 0.20), (pr//3, 0.32)]:
+            blend = tuple(min(255, int(col[c2] * alpha_frac + 0 * (1 - alpha_frac)))
+                          for c2 in range(3))
+            if any(v > 6 for v in blend):
+                d.ellipse([cx2-layer_r, cy2-layer_r, cx2+layer_r, cy2+layer_r],
+                           fill=blend)
+
+
+def _song_sparkles(d, accent_rgb, t):
+    """
+    16 tiny twinkling sparkle stars scattered across the frame.
+    Each blinks at its own speed — some are '+' shaped, some are dots.
+    """
+    rng = random.Random(13)
+    for i in range(16):
+        sx  = rng.uniform(0.04, 0.96) * W
+        sy  = rng.uniform(0.04, 0.92) * H
+        ph  = rng.random() * math.pi * 2
+        spd = rng.uniform(1.8, 4.5)
+        br  = abs(math.sin(t * spd + ph))   # 0→1 blink
+
+        if br < 0.18:    # fully faded out
+            continue
+
+        sz  = int(4 + br * 10)
+        col = tuple(min(255, int(c * 0.6 + 255 * 0.4 * br)) for c in accent_rgb)
+
+        cx2, cy2 = int(sx), int(sy)
+
+        if i % 3 == 0:
+            # "+" cross sparkle
+            arm = sz
+            lw  = max(1, sz // 4)
+            d.line([(cx2 - arm, cy2), (cx2 + arm, cy2)], fill=col, width=lw)
+            d.line([(cx2, cy2 - arm), (cx2, cy2 + arm)], fill=col, width=lw)
+            # diagonal arms (smaller)
+            da = arm * 2 // 3
+            d.line([(cx2-da, cy2-da), (cx2+da, cy2+da)], fill=col, width=max(1,lw-1))
+            d.line([(cx2+da, cy2-da), (cx2-da, cy2+da)], fill=col, width=max(1,lw-1))
+        else:
+            # dot sparkle
+            d.ellipse([cx2-sz//2, cy2-sz//2, cx2+sz//2, cy2+sz//2], fill=col)
+
+
+def _song_music_notes(d, accent_rgb, t):
+    """
+    5 music notes (♪ ♫) that slowly float upward and fade out,
+    then reappear at the bottom. Side margins so they don't clash with captions.
+    """
+    rng   = random.Random(21)
+    notes = ["♪", "♫", "♩", "♪", "♫"]
+    fnt_s = get_font(38, bold=False)
+    fnt_l = get_font(54, bold=False)
+
+    for i, note in enumerate(notes):
+        ph    = rng.random() * 10
+        spd   = rng.uniform(60, 110)
+        sx    = rng.choice([
+            int(W * rng.uniform(0.04, 0.18)),   # left column
+            int(W * rng.uniform(0.82, 0.96)),   # right column
+        ])
+        # vertical position: rises from 85% up to 5% of screen, then wraps
+        raw_y = (sy_base := H * 0.85) - ((t * spd + ph * 120) % (H * 0.85))
+        cy2   = int(raw_y)
+        # fade: bright near bottom, invisible near top
+        fade  = max(0.0, min(1.0, raw_y / (H * 0.6)))
+        wobble = int(math.sin(t * 1.4 + ph) * 18)
+        cx2   = sx + wobble
+
+        col = tuple(min(255, int(c * 0.55 + 255 * 0.45 * fade)) for c in accent_rgb)
+        fnt = fnt_l if i % 2 == 0 else fnt_s
+        try:
+            d.text((cx2, cy2), note, fill=col, font=fnt)
+        except:
+            pass
+
+
+def _song_light_leak(d, accent_rgb, t):
+    """
+    2 cinematic light leak streaks — diagonal bands of soft colour
+    that slowly sweep across the frame once in a while.
+    """
+    # Light leak 1 — top-left corner, accent colour
+    ph1 = (t * 0.12) % (2 * math.pi)
+    intensity1 = max(0.0, math.sin(ph1) * 0.55)
+    if intensity1 > 0.04:
+        leak_col = tuple(min(255, int(c * intensity1)) for c in accent_rgb)
+        # Draw a wide diagonal wedge from top-left
+        pts1 = [(0, 0), (int(W * 0.55), 0), (0, int(H * 0.30))]
+        d.polygon(pts1, fill=leak_col)
+
+    # Light leak 2 — bottom-right, warm gold tint
+    ph2 = (t * 0.09 + math.pi) % (2 * math.pi)
+    intensity2 = max(0.0, math.sin(ph2) * 0.45)
+    if intensity2 > 0.04:
+        gold = (255, 220, 80)
+        leak_col2 = tuple(min(255, int(c * intensity2)) for c in gold)
+        pts2 = [(W, H), (int(W * 0.55), H), (W, int(H * 0.72))]
+        d.polygon(pts2, fill=leak_col2)
+
+
+def draw_song_overlay(d, accent_rgb, t):
+    """
+    Master overlay for song bg-image videos.
+    Stacks all 4 animation layers in order:
+      1. bokeh orbs   (dreamy depth)
+      2. sparkles     (energy / shimmer)
+      3. music notes  (song identity)
+      4. light leaks  (cinematic warmth)
+    """
+    _song_bokeh_orbs  (d, accent_rgb, t)
+    _song_sparkles    (d, accent_rgb, t)
+    _song_music_notes (d, accent_rgb, t)
+    _song_light_leak  (d, accent_rgb, t)
+
 
 def draw_cat(d, cx, cy, t):
     phase=(t%8)
@@ -711,6 +928,112 @@ def draw_lyrics(d, lines_data, t, accent_rgb, style="bright"):
         word_idx += len(line_words)
 
 
+def draw_lyrics_simple(d, lines_data, t, accent_rgb, style="bright", bg_image=False):
+    """
+    SIMPLE 1-line caption: word-by-word reveal, clean pill, bottom-center.
+    - Auto-shrinks font to keep everything on ONE line
+    - bg_image=True → dark pill (works well on photos)
+    """
+    cur = 0
+    for i, ld in enumerate(lines_data):
+        if t >= ld["start"]: cur = i
+
+    raw_text = lines_data[cur]["text"]
+    text     = hindi_to_hinglish(raw_text)
+    words    = text.split()
+    if not words: return
+
+    dur     = max(0.1, lines_data[cur]["end"] - lines_data[cur]["start"])
+    prog    = max(0.0, min(1.0, (t - lines_data[cur]["start"]) / dur))
+    n_shown = max(1, int(prog * (len(words) + 0.5)))
+
+    BOTTOM_PAD = 82
+    MAX_W      = W - 80
+
+    # Auto-size: shrink until whole line fits on one row
+    fnt_bold = fnt_reg = None
+    chosen_fs = 44
+    for fs in (72, 62, 54, 46, 40, 34):
+        f = get_font(fs, bold=True)
+        try:
+            bb = d.textbbox((0, 0), text, font=f)
+            if (bb[2] - bb[0]) <= MAX_W:
+                chosen_fs = fs; fnt_bold = f; break
+        except:
+            chosen_fs = fs; fnt_bold = f; break
+    if fnt_bold is None:
+        fnt_bold = get_font(chosen_fs, bold=True)
+    fnt_reg = get_font(chosen_fs, bold=False)
+
+    try:
+        bb = d.textbbox((0, 0), "Ag", font=fnt_bold)
+        line_h = bb[3] - bb[1]
+    except:
+        line_h = chosen_fs + 8
+
+    line_y = H - BOTTOM_PAD - line_h - 40
+
+    try:
+        bb_full = d.textbbox((0, 0), text, font=fnt_bold)
+        full_w  = min(bb_full[2] - bb_full[0], MAX_W)
+    except:
+        full_w = MAX_W
+
+    pad_h, pad_v = 38, 22
+    bx1 = (W - full_w) // 2 - pad_h
+    bx2 = (W + full_w) // 2 + pad_h
+    by1 = line_y - pad_v
+    by2 = line_y + line_h + pad_v
+
+    # Shadow
+    d.rounded_rectangle([bx1+5, by1+5, bx2+5, by2+5], radius=28, fill=(0, 0, 0))
+
+    # Pill background
+    if style == "bright" and not bg_image:
+        d.rounded_rectangle([bx1, by1, bx2, by2], radius=28, fill=(255, 255, 255))
+        d.rounded_rectangle([bx1, by1, bx2, by2], radius=28, outline=accent_rgb, width=4)
+        prev_col   = (30, 30, 30)
+        fut_col    = (165, 165, 165)
+        active_col = accent_rgb
+    else:
+        d.rounded_rectangle([bx1, by1, bx2, by2], radius=28, fill=(10, 8, 28))
+        d.rounded_rectangle([bx1, by1, bx2, by2], radius=28, outline=accent_rgb, width=4)
+        prev_col   = tuple(min(255, c + 80) for c in accent_rgb)
+        fut_col    = (55, 55, 80)
+        active_col = (255, 255, 255)
+
+    # Center start X
+    try:
+        bb2   = d.textbbox((0, 0), text, font=fnt_bold)
+        cur_x = (W - (bb2[2] - bb2[0])) // 2
+    except:
+        cur_x = bx1 + pad_h
+
+    for wi, word in enumerate(words):
+        revealed  = wi < n_shown
+        is_active = wi == n_shown - 1
+
+        try:
+            wb = d.textbbox((0, 0), word, font=fnt_bold)
+            sb = d.textbbox((0, 0), " ",  font=fnt_bold)
+            ww = wb[2] - wb[0]
+            sp = sb[2] - sb[0]
+        except:
+            ww = len(word) * int(chosen_fs * 0.55)
+            sp = chosen_fs // 4
+
+        if is_active:
+            d.text((cur_x, line_y), word, fill=active_col, font=fnt_bold)
+            d.rounded_rectangle([cur_x, line_y+line_h+3, cur_x+ww, line_y+line_h+8],
+                                  radius=3, fill=accent_rgb)
+        elif revealed:
+            d.text((cur_x, line_y), word, fill=prev_col, font=fnt_bold)
+        else:
+            d.text((cur_x, line_y), word, fill=fut_col,  font=fnt_reg)
+
+        cur_x += ww + sp
+
+
 def draw_title(d, title, accent_rgb, style="bright"):
     if not title: return
     # Transliterate title too
@@ -743,7 +1066,7 @@ def draw_progress(d, progress, accent_rgb):
             d.line([(x,H-bh),(x,H)],fill=col)
 
 
-def render_frame(lines_data, fi, total_frames, cfg, title):
+def render_frame(lines_data, fi, total_frames, cfg, title, bg_image_paths=None):
     t = fi/FPS
     progress = fi/max(total_frames,1)
     col1,col2 = cfg["bg"]
@@ -753,7 +1076,12 @@ def render_frame(lines_data, fi, total_frames, cfg, title):
     img = Image.new("RGB",(W,H),(20,20,40))
     d   = ImageDraw.Draw(img)
 
-    if style == "lofi":
+    if bg_image_paths:
+        # Use custom background images with Ken Burns effect
+        _draw_bg_image_kenburns(img, fi, total_frames, bg_image_paths)
+        d = ImageDraw.Draw(img)   # refresh Draw after paste
+        draw_song_overlay(d, accent, t)   # ← bokeh + sparkles + notes + light leak
+    elif style == "lofi":
         draw_lofi_bg(d, col1, col2, accent, t)
     else:
         draw_bg(d,col1,col2,t)
@@ -770,7 +1098,9 @@ def render_frame(lines_data, fi, total_frames, cfg, title):
         char_fn = CHARS.get(cfg["char"],draw_kid)
         char_fn(d, W//2, int(H*0.76), t)
 
-    if lines_data: draw_lyrics(d,lines_data,t,accent,style)
+    if lines_data:
+        draw_lyrics_simple(d, lines_data, t, accent, style,
+                           bg_image=bool(bg_image_paths))
     draw_progress(d,progress,accent)
 
     return img
@@ -779,12 +1109,22 @@ def render_frame(lines_data, fi, total_frames, cfg, title):
 #  VIDEO BUILDER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_video(content, job_id, song_key="", bg_key="", char_override=""):
+def build_video(content, job_id, song_key="", bg_key="", char_override="", bg_image_keys=None):
     tmp = os.path.join("C:/tmp" if os.name=="nt" else "/tmp", f"kh7_{job_id}")
     os.makedirs(f"{tmp}/frames", exist_ok=True)
 
     lines_text = content.get("lines",[])
     title      = content.get("title","")
+
+    # ── Resolve bg image paths ────────────────────────────────────────────────
+    bg_image_paths = []
+    if bg_image_keys:
+        for key in bg_image_keys:
+            fp = os.path.join(BG_IMAGES_DIR, key)
+            if os.path.exists(fp):
+                bg_image_paths.append(fp)
+    if bg_image_paths:
+        print(f"[Build] BG images: {[os.path.basename(p) for p in bg_image_paths]}")
 
     # ── Find song: use song_key first, fall back to bg_key/title ─────────────
     search_key = song_key or bg_key or title
@@ -819,12 +1159,14 @@ def build_video(content, job_id, song_key="", bg_key="", char_override=""):
 
     # ── Render frames ──────────────────────────────────────────────────────────
     jobs[job_id]["message"] = "🎨 Step 2/3: Frames render ho rahi hain..."
-    print(f"[Build] Rendering {total_frames} frames (style={cfg.get('style','bright')})...")
+    print(f"[Build] Rendering {total_frames} frames (style={cfg.get('style','bright')}, "
+          f"bg_imgs={len(bg_image_paths)})...")
 
     for fi in range(total_frames):
         if fi % 30 == 0:
             jobs[job_id]["progress"] = 10 + fi*75//max(total_frames,1)
-        img = render_frame(lines_data, fi, total_frames, cfg, title)
+        img = render_frame(lines_data, fi, total_frames, cfg, title,
+                           bg_image_paths=bg_image_paths or None)
         img.save(f"{tmp}/frames/f{fi:05d}.png")
 
     # ── Encode ─────────────────────────────────────────────────────────────────
@@ -918,7 +1260,8 @@ def run_job(job_id, params):
         vp = build_video(content, job_id,
                          song_key=song_key,
                          bg_key=bg_key or bk,
-                         char_override=cha)
+                         char_override=cha,
+                         bg_image_keys=params.get("bg_image_keys", []))
         job["status"]="done"; job["progress"]=100
         job["message"]="🎉 Video taiyaar hai!"; job["video_path"]=vp
 
@@ -1021,6 +1364,54 @@ def map_song():
     if not os.path.exists(os.path.join(SONGS_DIR,fname)): return jsonify({"error":"File not found"}),404
     _MAP[key]=fname; save_mapping(_MAP)
     return jsonify({"ok":True,"mapped":f"{key}->{fname}"})
+
+# ── Background Image API ──────────────────────────────────────────────────────
+
+@app.route("/api/upload-bg-image", methods=["POST"])
+def upload_bg_image():
+    if "file" not in request.files:
+        return jsonify({"error":"No file"}), 400
+    f = request.files["file"]
+    allowed = ('.jpg','.jpeg','.png','.webp')
+    if not any(f.filename.lower().endswith(e) for e in allowed):
+        return jsonify({"error":"Only jpg/jpeg/png/webp allowed"}), 400
+    safe = re.sub(r"[^\w\-.]","_", f.filename).lower()
+    fp   = os.path.join(BG_IMAGES_DIR, safe)
+    f.save(fp)
+    if fp in _bg_img_cache: del _bg_img_cache[fp]   # clear stale cache
+    return jsonify({"ok":True, "filename":safe,
+                    "size_kb": os.path.getsize(fp)//1024})
+
+@app.route("/api/bg-images")
+def list_bg_images():
+    imgs = []
+    try:
+        for fname in sorted(os.listdir(BG_IMAGES_DIR)):
+            if fname.lower().endswith(('.jpg','.jpeg','.png','.webp')):
+                fp = os.path.join(BG_IMAGES_DIR, fname)
+                imgs.append({"filename": fname,
+                             "size_kb":  os.path.getsize(fp)//1024})
+    except: pass
+    return jsonify(imgs)
+
+@app.route("/api/delete-bg-image/<fname>", methods=["DELETE"])
+def delete_bg_image(fname):
+    safe = re.sub(r"[^\w\-.]","_", fname)
+    fp   = os.path.join(BG_IMAGES_DIR, safe)
+    if not os.path.exists(fp):
+        return jsonify({"error":"Not found"}), 404
+    os.remove(fp)
+    if fp in _bg_img_cache: del _bg_img_cache[fp]
+    return jsonify({"ok":True})
+
+@app.route("/api/bg-image/<fname>")
+def serve_bg_image(fname):
+    safe = re.sub(r"[^\w\-.]","_", fname)
+    fp   = os.path.join(BG_IMAGES_DIR, safe)
+    if not os.path.exists(fp):
+        return jsonify({"error":"Not found"}), 404
+    return send_file(fp)
+
 
 if __name__=="__main__":
     print("="*55)
