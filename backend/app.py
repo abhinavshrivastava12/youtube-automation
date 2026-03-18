@@ -35,12 +35,9 @@ FPS     = 30
 FFMPEG  = shutil.which("ffmpeg")  or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
 
-SONGS_DIR      = os.path.join(_here, "songs")
-MAPPING_FILE   = os.path.join(_here, "song_mapping.json")
-BG_IMAGES_DIR  = os.path.join(_here, "bg_images")
-os.makedirs(SONGS_DIR,     exist_ok=True)
-os.makedirs(BG_IMAGES_DIR, exist_ok=True)
-_bg_img_cache = {}   # path → pre-scaled PIL Image
+SONGS_DIR    = os.path.join(_here, "songs")
+MAPPING_FILE = os.path.join(_here, "song_mapping.json")
+os.makedirs(SONGS_DIR, exist_ok=True)
 
 jobs = {}
 GROQ_KEY   = os.getenv("GROQ_API_KEY", "")
@@ -206,12 +203,51 @@ def draw_bokeh(d, accent_rgb, t):
         d.ellipse([cx2-r,cy2-r,cx2+r,cy2+r],fill=light)
 
 def draw_stars_bg(d, t):
-    rng=random.Random(99)
-    for _ in range(180):
-        sx=rng.randint(0,W); sy=rng.randint(0,int(H*0.58))
-        fl=0.3+0.7*abs(math.sin(t*rng.uniform(1,5)+rng.random()*6.28))
-        br=int(150*fl+80); sr=rng.choice([1,1,2,2,3])
-        d.ellipse([sx-sr,sy-sr,sx+sr,sy+sr],fill=(br,br,min(255,br+20)))
+    rng = random.Random(99)
+    # Background faint stars
+    for _ in range(220):
+        sx  = rng.randint(0, W)
+        sy  = rng.randint(0, int(H * 0.60))
+        fl  = 0.3 + 0.7 * abs(math.sin(t * rng.uniform(0.8, 4.5) + rng.random() * 6.28))
+        br  = int(140 * fl + 90)
+        sr  = rng.choice([1, 1, 1, 2, 2, 3])
+        d.ellipse([sx-sr, sy-sr, sx+sr, sy+sr], fill=(br, br, min(255, br+25)))
+    # Bright twinkle stars (4 stars with cross-sparkle)
+    rng2 = random.Random(42)
+    for _ in range(4):
+        sx  = rng2.randint(60, W-60)
+        sy  = rng2.randint(40, int(H * 0.48))
+        spd = rng2.uniform(1.2, 2.6)
+        ph  = rng2.random() * 6.28
+        fl  = abs(math.sin(t * spd + ph))
+        if fl < 0.3: continue
+        size = int(4 + fl * 6)
+        br2 = min(255, int(180 + fl * 75))
+        col = (br2, br2, min(255, br2 + 20))
+        d.ellipse([sx-size, sy-size, sx+size, sy+size], fill=col)
+        # cross arms
+        arm = int(size * 2.5)
+        d.line([(sx-arm, sy), (sx+arm, sy)], fill=col, width=max(1, size//3))
+        d.line([(sx, sy-arm), (sx, sy+arm)], fill=col, width=max(1, size//3))
+    # Occasional shooting star
+    ss_cycle = 9.0
+    ss_t = t % ss_cycle
+    if 0.0 < ss_t < 1.4:
+        rng3 = random.Random(int(t / ss_cycle))
+        ss_sx = rng3.randint(200, W-100)
+        ss_sy = rng3.randint(30, int(H * 0.30))
+        prog  = ss_t / 1.4
+        trail = 280
+        ex  = ss_sx + int(trail * prog)
+        ey  = ss_sy + int(trail * prog * 0.45)
+        bri = int(255 * (1.0 - prog))
+        for seg_i in range(8):
+            seg_p = (seg_i / 8.0)
+            seg_x = ss_sx + int(trail * seg_p * prog)
+            seg_y = ss_sy + int(trail * seg_p * prog * 0.45)
+            seg_b = int(bri * (1.0 - seg_p * 0.6))
+            d.ellipse([seg_x-2, seg_y-2, seg_x+2, seg_y+2],
+                       fill=(seg_b, seg_b, min(255, seg_b+30)))
 
 def draw_lofi_bg(d, col1, col2, accent_rgb, t):
     """Lofi aesthetic: city window + rain streaks + glow dots"""
@@ -250,275 +286,98 @@ def draw_lofi_bg(d, col1, col2, accent_rgb, t):
         gr = 35 + i * 10
         d.ellipse([gx-gr, gy-gr, gx+gr, gy+gr], fill=accent_rgb)
 
-# ── Ken Burns background image support ───────────────────────────────────────
-_KEN_DIRS = [
-    (0.0, 0.0, 1.0, 0.3),   # pan right + slight down
-    (1.0, 0.3, 0.0, 0.0),   # pan left + slight up
-    (0.2, 0.0, 0.8, 1.0),   # diagonal: top-left → bottom-right
-    (0.8, 1.0, 0.2, 0.0),   # diagonal: bottom-right → top-left
-]
-
-def _load_and_scale_bg(path):
-    """Load, scale, and cache a background image. Scales to cover 1080×1920 + 15% pan room."""
-    if path in _bg_img_cache:
-        return _bg_img_cache[path]
-    try:
-        bg = Image.open(path).convert("RGB")
-    except Exception as e:
-        print(f"[BG] Cannot load {path}: {e}")
-        _bg_img_cache[path] = None
-        return None
-    bw, bh = bg.size
-    scale = max(W * 1.15 / bw, H * 1.15 / bh)
-    new_w = max(W + 2, int(bw * scale))
-    new_h = max(H + 2, int(bh * scale))
-    bg = bg.resize((new_w, new_h), Image.LANCZOS)
-    _bg_img_cache[path] = bg
-    print(f"[BG] Loaded+cached: {os.path.basename(path)} → {new_w}×{new_h}")
-    return bg
-
-def _draw_bg_image_kenburns(img_canvas, fi, total_frames, bg_paths):
-    """
-    Ken Burns effect: each image shown for equal time, slow pan per image,
-    crossfade in last 15% of each segment. 40% dark overlay for readability.
-    """
-    n = len(bg_paths)
-    seg   = max(1.0, total_frames / n)
-    i_idx = min(int(fi / seg), n - 1)
-    n_idx = (i_idx + 1) % n
-    seg_p = (fi % seg) / max(seg, 1)   # 0→1 within segment
-
-    def get_frame(path, prog, dir_idx):
-        base = _load_and_scale_bg(path)
-        if base is None:
-            return Image.new("RGB", (W, H), (10, 10, 20))
-        bw, bh = base.size
-        px = max(0, bw - W)
-        py = max(0, bh - H)
-        dx0, dy0, dx1, dy1 = _KEN_DIRS[dir_idx % len(_KEN_DIRS)]
-        cx = int(px * (dx0 + (dx1 - dx0) * prog))
-        cy = int(py * (dy0 + (dy1 - dy0) * prog))
-        cx = max(0, min(px, cx))
-        cy = max(0, min(py, cy))
-        frame = base.crop((cx, cy, cx + W, cy + H))
-        dark  = Image.new("RGB", (W, H), (0, 0, 0))
-        return Image.blend(frame, dark, 0.40)   # 40% dark overlay
-
-    cur_frame = get_frame(bg_paths[i_idx], seg_p, i_idx)
-
-    if seg_p > 0.85 and n > 1:                 # crossfade last 15%
-        blend_t = (seg_p - 0.85) / 0.15
-        nxt     = get_frame(bg_paths[n_idx], 0.0, n_idx)
-        cur_frame = Image.blend(cur_frame, nxt, blend_t)
-
-    img_canvas.paste(cur_frame, (0, 0))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SONG OVERLAY ANIMATIONS — drawn ON TOP of bg image (Ken Burns)
-#  These 4 layers are always stacked together for song videos
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _song_bokeh_orbs(d, accent_rgb, t):
-    """
-    8 slow-drifting glowing orbs — each a soft radial blob.
-    Colours: accent + white + warm gold mix.
-    """
-    rng  = random.Random(7)
-    cols = [
-        accent_rgb,
-        tuple(min(255, c + 90) for c in accent_rgb),
-        (255, 230, 120),   # warm gold
-        (255, 255, 255),   # white
-        tuple(max(0, c - 40) for c in accent_rgb),
-    ]
-    for i in range(8):
-        r    = rng.randint(28, 80)
-        sx   = rng.uniform(0.05, 0.95) * W
-        sy   = rng.uniform(0.05, 0.85) * H
-        spd  = rng.uniform(8, 22)
-        ph   = rng.random() * math.pi * 2
-        col  = cols[i % len(cols)]
-
-        # Gentle Lissajous drift
-        cx2  = int((sx + math.sin(t * 0.35 + ph)       * 70) % W)
-        cy2  = int((sy + math.sin(t * 0.22 + ph * 1.3) * 50) % H)
-
-        # Pulse radius slightly
-        pr = r + int(math.sin(t * 1.8 + ph) * 10)
-
-        # Draw 3-layer soft blob: outer dim, mid, inner bright
-        for layer_r, alpha_frac in [(pr, 0.12), (pr*2//3, 0.20), (pr//3, 0.32)]:
-            blend = tuple(min(255, int(col[c2] * alpha_frac + 0 * (1 - alpha_frac)))
-                          for c2 in range(3))
-            if any(v > 6 for v in blend):
-                d.ellipse([cx2-layer_r, cy2-layer_r, cx2+layer_r, cy2+layer_r],
-                           fill=blend)
-
-
-def _song_sparkles(d, accent_rgb, t):
-    """
-    16 tiny twinkling sparkle stars scattered across the frame.
-    Each blinks at its own speed — some are '+' shaped, some are dots.
-    """
-    rng = random.Random(13)
-    for i in range(16):
-        sx  = rng.uniform(0.04, 0.96) * W
-        sy  = rng.uniform(0.04, 0.92) * H
-        ph  = rng.random() * math.pi * 2
-        spd = rng.uniform(1.8, 4.5)
-        br  = abs(math.sin(t * spd + ph))   # 0→1 blink
-
-        if br < 0.18:    # fully faded out
-            continue
-
-        sz  = int(4 + br * 10)
-        col = tuple(min(255, int(c * 0.6 + 255 * 0.4 * br)) for c in accent_rgb)
-
-        cx2, cy2 = int(sx), int(sy)
-
-        if i % 3 == 0:
-            # "+" cross sparkle
-            arm = sz
-            lw  = max(1, sz // 4)
-            d.line([(cx2 - arm, cy2), (cx2 + arm, cy2)], fill=col, width=lw)
-            d.line([(cx2, cy2 - arm), (cx2, cy2 + arm)], fill=col, width=lw)
-            # diagonal arms (smaller)
-            da = arm * 2 // 3
-            d.line([(cx2-da, cy2-da), (cx2+da, cy2+da)], fill=col, width=max(1,lw-1))
-            d.line([(cx2+da, cy2-da), (cx2-da, cy2+da)], fill=col, width=max(1,lw-1))
-        else:
-            # dot sparkle
-            d.ellipse([cx2-sz//2, cy2-sz//2, cx2+sz//2, cy2+sz//2], fill=col)
-
-
-def _song_music_notes(d, accent_rgb, t):
-    """
-    5 music notes (♪ ♫) that slowly float upward and fade out,
-    then reappear at the bottom. Side margins so they don't clash with captions.
-    """
-    rng   = random.Random(21)
-    notes = ["♪", "♫", "♩", "♪", "♫"]
-    fnt_s = get_font(38, bold=False)
-    fnt_l = get_font(54, bold=False)
-
-    for i, note in enumerate(notes):
-        ph    = rng.random() * 10
-        spd   = rng.uniform(60, 110)
-        sx    = rng.choice([
-            int(W * rng.uniform(0.04, 0.18)),   # left column
-            int(W * rng.uniform(0.82, 0.96)),   # right column
-        ])
-        # vertical position: rises from 85% up to 5% of screen, then wraps
-        raw_y = (sy_base := H * 0.85) - ((t * spd + ph * 120) % (H * 0.85))
-        cy2   = int(raw_y)
-        # fade: bright near bottom, invisible near top
-        fade  = max(0.0, min(1.0, raw_y / (H * 0.6)))
-        wobble = int(math.sin(t * 1.4 + ph) * 18)
-        cx2   = sx + wobble
-
-        col = tuple(min(255, int(c * 0.55 + 255 * 0.45 * fade)) for c in accent_rgb)
-        fnt = fnt_l if i % 2 == 0 else fnt_s
-        try:
-            d.text((cx2, cy2), note, fill=col, font=fnt)
-        except:
-            pass
-
-
-def _song_light_leak(d, accent_rgb, t):
-    """
-    2 cinematic light leak streaks — diagonal bands of soft colour
-    that slowly sweep across the frame once in a while.
-    """
-    # Light leak 1 — top-left corner, accent colour
-    ph1 = (t * 0.12) % (2 * math.pi)
-    intensity1 = max(0.0, math.sin(ph1) * 0.55)
-    if intensity1 > 0.04:
-        leak_col = tuple(min(255, int(c * intensity1)) for c in accent_rgb)
-        # Draw a wide diagonal wedge from top-left
-        pts1 = [(0, 0), (int(W * 0.55), 0), (0, int(H * 0.30))]
-        d.polygon(pts1, fill=leak_col)
-
-    # Light leak 2 — bottom-right, warm gold tint
-    ph2 = (t * 0.09 + math.pi) % (2 * math.pi)
-    intensity2 = max(0.0, math.sin(ph2) * 0.45)
-    if intensity2 > 0.04:
-        gold = (255, 220, 80)
-        leak_col2 = tuple(min(255, int(c * intensity2)) for c in gold)
-        pts2 = [(W, H), (int(W * 0.55), H), (W, int(H * 0.72))]
-        d.polygon(pts2, fill=leak_col2)
-
-
-def draw_song_overlay(d, accent_rgb, t):
-    """
-    Master overlay for song bg-image videos.
-    Stacks all 4 animation layers in order:
-      1. bokeh orbs   (dreamy depth)
-      2. sparkles     (energy / shimmer)
-      3. music notes  (song identity)
-      4. light leaks  (cinematic warmth)
-    """
-    _song_bokeh_orbs  (d, accent_rgb, t)
-    _song_sparkles    (d, accent_rgb, t)
-    _song_music_notes (d, accent_rgb, t)
-    _song_light_leak  (d, accent_rgb, t)
-
-
 def draw_cat(d, cx, cy, t):
-    phase=(t%8)
-    bounce=int(abs(math.sin(t*3.5))*42); swing=0
-    if phase<2: pass
-    elif phase<4: bounce=int(abs(math.sin(t*2))*20); swing=int(math.sin(t*2)*35)
-    elif phase<6: bounce=int(abs(math.sin(t*6))*30); swing=int(math.sin(t*5)*20)
-    else: bounce=int(abs(math.sin(t*3))*25); swing=int(math.sin(t*3)*45)
-    cy-=bounce; cx+=swing
-    bc=(255,140,50); bel=(255,200,150); ec=(220,90,25); ie=(255,170,185)
-    d.ellipse([cx-105,cy+165,cx+105,cy+195],fill=(200,80,100))
-    px,py=None,None
-    for i in range(22):
-        ang=i/22*math.pi+t*1.2; tx2=cx+118+int(58*math.sin(ang)); ty2=cy+50-i*11
-        if px: d.line([(px,py),(tx2,ty2)],fill=bc,width=30)
-        px,py=tx2,ty2
-    if px: d.ellipse([px-18,py-18,px+18,py+18],fill=(255,175,75))
-    d.ellipse([cx-112,cy-145,cx+112,cy+75],fill=bc)
-    d.ellipse([cx-60,cy-95,cx+60,cy+52],fill=bel)
-    hr=118; hx=cx; hy=cy-145-hr+18
-    d.polygon([(hx-90,hy+18),(hx-42,hy-hr-82),(hx-10,hy-hr+16)],fill=ec)
-    d.polygon([(hx-78,hy+10),(hx-44,hy-hr-58),(hx-15,hy-hr+11)],fill=ie)
-    d.polygon([(hx+90,hy+18),(hx+42,hy-hr-82),(hx+10,hy-hr+16)],fill=ec)
-    d.polygon([(hx+78,hy+10),(hx+44,hy-hr-58),(hx+15,hy-hr+11)],fill=ie)
-    d.ellipse([hx-hr,hy-hr,hx+hr,hy+hr],fill=bc)
-    blink=abs(math.sin(t*0.55))>0.94; squint=(4<=phase<6)
-    for xo in [-38,38]:
-        ex2,ey2=hx+xo,hy-11
-        if blink: d.arc([ex2-22,ey2-6,ex2+22,ey2+6],195,345,fill=(40,25,8),width=7)
-        elif squint: d.arc([ex2-22,ey2-8,ex2+22,ey2+12],200,340,fill=(40,25,8),width=7)
-        else:
-            d.ellipse([ex2-22,ey2-20,ex2+22,ey2+20],fill=(255,255,255))
-            d.ellipse([ex2-13,ey2-18,ex2+13,ey2+18],fill=(40,25,8))
-            d.ellipse([ex2-7,ey2-16,ex2-2,ey2-9],fill=(255,255,255))
-    d.polygon([(hx,hy+16),(hx-13,hy+4),(hx+13,hy+4)],fill=(255,110,145))
-    d.arc([hx-26,hy+22,hx+26,hy+52],15,165,fill=(170,55,75),width=6)
-    for xo in [-68,68]: d.ellipse([hx+xo-28,hy+8,hx+xo+28,hy+36],fill=(255,155,155))
-    wy=hy+24
-    for wx1,wx2,wy1,wy2 in [(-20,-94,2,-10),(-20,-90,11,-2),(-20,-86,20,6)]:
-        d.line([(hx+wx1,wy+wy1),(hx+wx2,wy+wy2)],fill=(200,155,115),width=3)
-    for wx1,wx2,wy1,wy2 in [(20,94,2,-10),(20,90,11,-2),(20,86,20,6)]:
-        d.line([(hx+wx1,wy+wy1),(hx+wx2,wy+wy2)],fill=(200,155,115),width=3)
-    if phase<2:
-        aw=math.sin(t*3.5)*60
-        d.line([cx-112,cy-35,cx-180,cy-82-int(aw)],fill=bc,width=40)
-        d.ellipse([cx-210,cy-112-int(aw)-30,cx-158,cy-112-int(aw)+30],fill=bc)
-        d.line([cx+112,cy-35,cx+180,cy-82+int(aw)],fill=bc,width=40)
-        d.ellipse([cx+158,cy-112+int(aw)-30,cx+210,cy-112+int(aw)+30],fill=bc)
+    phase = (t % 8)
+    # Smoother motion: blend between phases
+    if phase < 2:
+        bounce = int(abs(math.sin(t * 3.2)) * 36)
+        swing  = int(math.sin(t * 1.6) * 12)
+    elif phase < 4:
+        bounce = int(abs(math.sin(t * 2.1)) * 22)
+        swing  = int(math.sin(t * 2.1) * 38)
+    elif phase < 6:
+        bounce = int(abs(math.sin(t * 5.8)) * 28)
+        swing  = int(math.sin(t * 4.8) * 22)
     else:
-        aw=math.sin(t*3)*50
-        d.line([cx-112,cy-35,cx-172,cy-75-int(aw)],fill=bc,width=40)
-        d.ellipse([cx-202,cy-105-int(aw)-30,cx-150,cy-105-int(aw)+30],fill=bc)
-        d.line([cx+112,cy-35,cx+172,cy-75+int(aw*0.5)],fill=bc,width=40)
-        d.ellipse([cx+150,cy-105+int(aw*0.5)-30,cx+202,cy-105+int(aw*0.5)+30],fill=bc)
-    lk=int(math.sin(t*4)*18)
-    for xo in [-44,44]: d.ellipse([cx+xo-40,cy+50+lk,cx+xo+40,cy+108+lk],fill=bc)
+        bounce = int(abs(math.sin(t * 3.0)) * 28)
+        swing  = int(math.sin(t * 3.0) * 48)
+    cy -= bounce; cx += swing
+
+    bc  = (255, 140, 50)
+    bel = (255, 200, 150)
+    ec  = (220, 90, 25)
+    ie  = (255, 170, 185)
+
+    # Shadow ellipse
+    d.ellipse([cx-105, cy+165, cx+105, cy+195], fill=(200, 80, 100))
+
+    # Curved tail (Bezier-like approximation with 24 segments)
+    px, py = None, None
+    for i in range(24):
+        ang  = i / 24 * math.pi + t * 1.3
+        tx2  = cx + 120 + int(62 * math.sin(ang))
+        ty2  = cy + 55  - i * 10
+        if px is not None:
+            d.line([(px, py), (tx2, ty2)], fill=bc, width=28)
+        px, py = tx2, ty2
+    if px is not None:
+        d.ellipse([px-16, py-16, px+16, py+16], fill=(255, 175, 75))
+
+    # Body
+    d.ellipse([cx-112, cy-145, cx+112, cy+75],  fill=bc)
+    d.ellipse([cx-60,  cy-95,  cx+60,  cy+52],  fill=bel)
+
+    # Ears
+    hr = 118; hx = cx; hy = cy - 145 - hr + 18
+    d.polygon([(hx-90, hy+18), (hx-42, hy-hr-82), (hx-10, hy-hr+16)], fill=ec)
+    d.polygon([(hx-78, hy+10), (hx-44, hy-hr-58), (hx-15, hy-hr+11)], fill=ie)
+    d.polygon([(hx+90, hy+18), (hx+42, hy-hr-82), (hx+10, hy-hr+16)], fill=ec)
+    d.polygon([(hx+78, hy+10), (hx+44, hy-hr-58), (hx+15, hy-hr+11)], fill=ie)
+
+    # Head
+    d.ellipse([hx-hr, hy-hr, hx+hr, hy+hr], fill=bc)
+
+    # Eyes — blink every ~4s, squint during fast phase
+    blink  = abs(math.sin(t * 0.52)) > 0.95
+    squint = (4 <= phase < 6)
+    for xo in [-38, 38]:
+        ex2, ey2 = hx + xo, hy - 11
+        if blink:
+            d.arc([ex2-22, ey2-6, ex2+22, ey2+6], 195, 345, fill=(40, 25, 8), width=7)
+        elif squint:
+            d.arc([ex2-22, ey2-8, ex2+22, ey2+12], 200, 340, fill=(40, 25, 8), width=7)
+        else:
+            d.ellipse([ex2-22, ey2-20, ex2+22, ey2+20], fill=(255, 255, 255))
+            d.ellipse([ex2-13, ey2-18, ex2+13, ey2+18], fill=(40, 25, 8))
+            d.ellipse([ex2-7,  ey2-16, ex2-2,  ey2-9],  fill=(255, 255, 255))
+
+    # Nose + mouth
+    d.polygon([(hx, hy+16), (hx-13, hy+4), (hx+13, hy+4)], fill=(255, 110, 145))
+    d.arc([hx-26, hy+22, hx+26, hy+52], 15, 165, fill=(170, 55, 75), width=6)
+
+    # Cheek blush
+    for xo in [-68, 68]:
+        d.ellipse([hx+xo-28, hy+8, hx+xo+28, hy+36], fill=(255, 155, 155))
+
+    # Whiskers
+    wy = hy + 24
+    for wx1, wx2, wy1, wy2 in [(-20,-94,2,-10),(-20,-90,11,-2),(-20,-86,20,6)]:
+        d.line([(hx+wx1, wy+wy1), (hx+wx2, wy+wy2)], fill=(200,155,115), width=3)
+    for wx1, wx2, wy1, wy2 in [(20,94,2,-10),(20,90,11,-2),(20,86,20,6)]:
+        d.line([(hx+wx1, wy+wy1), (hx+wx2, wy+wy2)], fill=(200,155,115), width=3)
+
+    # Arms with alternating up/down
+    aw = math.sin(t * 3.2) * 55
+    d.line([cx-112, cy-35, cx-178, cy-78-int(aw)],  fill=bc, width=40)
+    d.ellipse([cx-206, cy-108-int(aw)-28, cx-154, cy-108-int(aw)+28], fill=bc)
+    d.line([cx+112, cy-35, cx+178, cy-78+int(aw*0.6)], fill=bc, width=40)
+    d.ellipse([cx+154, cy-108+int(aw*0.6)-28, cx+206, cy-108+int(aw*0.6)+28], fill=bc)
+
+    # Feet — alternating tap
+    lk = int(math.sin(t * 4.0) * 20)
+    for xo in [-44, 44]:
+        d.ellipse([cx+xo-40, cy+50+(lk if xo<0 else -lk),
+                   cx+xo+40, cy+108+(lk if xo<0 else -lk)], fill=bc)
 
 
 def draw_fish(d, cx, cy, t):
@@ -928,112 +787,6 @@ def draw_lyrics(d, lines_data, t, accent_rgb, style="bright"):
         word_idx += len(line_words)
 
 
-def draw_lyrics_simple(d, lines_data, t, accent_rgb, style="bright", bg_image=False):
-    """
-    SIMPLE 1-line caption: word-by-word reveal, clean pill, bottom-center.
-    - Auto-shrinks font to keep everything on ONE line
-    - bg_image=True → dark pill (works well on photos)
-    """
-    cur = 0
-    for i, ld in enumerate(lines_data):
-        if t >= ld["start"]: cur = i
-
-    raw_text = lines_data[cur]["text"]
-    text     = hindi_to_hinglish(raw_text)
-    words    = text.split()
-    if not words: return
-
-    dur     = max(0.1, lines_data[cur]["end"] - lines_data[cur]["start"])
-    prog    = max(0.0, min(1.0, (t - lines_data[cur]["start"]) / dur))
-    n_shown = max(1, int(prog * (len(words) + 0.5)))
-
-    BOTTOM_PAD = 82
-    MAX_W      = W - 80
-
-    # Auto-size: shrink until whole line fits on one row
-    fnt_bold = fnt_reg = None
-    chosen_fs = 44
-    for fs in (72, 62, 54, 46, 40, 34):
-        f = get_font(fs, bold=True)
-        try:
-            bb = d.textbbox((0, 0), text, font=f)
-            if (bb[2] - bb[0]) <= MAX_W:
-                chosen_fs = fs; fnt_bold = f; break
-        except:
-            chosen_fs = fs; fnt_bold = f; break
-    if fnt_bold is None:
-        fnt_bold = get_font(chosen_fs, bold=True)
-    fnt_reg = get_font(chosen_fs, bold=False)
-
-    try:
-        bb = d.textbbox((0, 0), "Ag", font=fnt_bold)
-        line_h = bb[3] - bb[1]
-    except:
-        line_h = chosen_fs + 8
-
-    line_y = H - BOTTOM_PAD - line_h - 40
-
-    try:
-        bb_full = d.textbbox((0, 0), text, font=fnt_bold)
-        full_w  = min(bb_full[2] - bb_full[0], MAX_W)
-    except:
-        full_w = MAX_W
-
-    pad_h, pad_v = 38, 22
-    bx1 = (W - full_w) // 2 - pad_h
-    bx2 = (W + full_w) // 2 + pad_h
-    by1 = line_y - pad_v
-    by2 = line_y + line_h + pad_v
-
-    # Shadow
-    d.rounded_rectangle([bx1+5, by1+5, bx2+5, by2+5], radius=28, fill=(0, 0, 0))
-
-    # Pill background
-    if style == "bright" and not bg_image:
-        d.rounded_rectangle([bx1, by1, bx2, by2], radius=28, fill=(255, 255, 255))
-        d.rounded_rectangle([bx1, by1, bx2, by2], radius=28, outline=accent_rgb, width=4)
-        prev_col   = (30, 30, 30)
-        fut_col    = (165, 165, 165)
-        active_col = accent_rgb
-    else:
-        d.rounded_rectangle([bx1, by1, bx2, by2], radius=28, fill=(10, 8, 28))
-        d.rounded_rectangle([bx1, by1, bx2, by2], radius=28, outline=accent_rgb, width=4)
-        prev_col   = tuple(min(255, c + 80) for c in accent_rgb)
-        fut_col    = (55, 55, 80)
-        active_col = (255, 255, 255)
-
-    # Center start X
-    try:
-        bb2   = d.textbbox((0, 0), text, font=fnt_bold)
-        cur_x = (W - (bb2[2] - bb2[0])) // 2
-    except:
-        cur_x = bx1 + pad_h
-
-    for wi, word in enumerate(words):
-        revealed  = wi < n_shown
-        is_active = wi == n_shown - 1
-
-        try:
-            wb = d.textbbox((0, 0), word, font=fnt_bold)
-            sb = d.textbbox((0, 0), " ",  font=fnt_bold)
-            ww = wb[2] - wb[0]
-            sp = sb[2] - sb[0]
-        except:
-            ww = len(word) * int(chosen_fs * 0.55)
-            sp = chosen_fs // 4
-
-        if is_active:
-            d.text((cur_x, line_y), word, fill=active_col, font=fnt_bold)
-            d.rounded_rectangle([cur_x, line_y+line_h+3, cur_x+ww, line_y+line_h+8],
-                                  radius=3, fill=accent_rgb)
-        elif revealed:
-            d.text((cur_x, line_y), word, fill=prev_col, font=fnt_bold)
-        else:
-            d.text((cur_x, line_y), word, fill=fut_col,  font=fnt_reg)
-
-        cur_x += ww + sp
-
-
 def draw_title(d, title, accent_rgb, style="bright"):
     if not title: return
     # Transliterate title too
@@ -1066,128 +819,484 @@ def draw_progress(d, progress, accent_rgb):
             d.line([(x,H-bh),(x,H)],fill=col)
 
 
-def render_frame(lines_data, fi, total_frames, cfg, title, bg_image_paths=None):
-    t = fi/FPS
-    progress = fi/max(total_frames,1)
-    col1,col2 = cfg["bg"]
-    accent = hex_rgb(cfg["accent"])
-    style = cfg.get("style","bright")
 
-    img = Image.new("RGB",(W,H),(20,20,40))
-    d   = ImageDraw.Draw(img)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SONG VIDEO ENGINE — Ken Burns + Synced Captions (no characters)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    if bg_image_paths:
-        # Use custom background images with Ken Burns effect
-        _draw_bg_image_kenburns(img, fi, total_frames, bg_image_paths)
-        d = ImageDraw.Draw(img)   # refresh Draw after paste
-        draw_song_overlay(d, accent, t)   # ← bokeh + sparkles + notes + light leak
-    elif style == "lofi":
-        draw_lofi_bg(d, col1, col2, accent, t)
+BG_IMAGES_DIR = os.path.join(_here, "bg_images")
+os.makedirs(BG_IMAGES_DIR, exist_ok=True)
+
+_img_cache = {}  # filename → (PIL.Image at 15% overscan)
+
+# Pan directions for Ken Burns: (start_x_frac, start_y_frac, end_x_frac, end_y_frac)
+_KB_MOVES = [
+    (0.0, 0.0, 1.0, 0.0),   # pan right
+    (1.0, 0.0, 0.0, 0.0),   # pan left
+    (0.0, 0.0, 0.0, 1.0),   # pan down
+    (0.0, 1.0, 0.0, 0.0),   # pan up
+    (0.0, 0.0, 1.0, 1.0),   # diagonal TL→BR
+    (1.0, 1.0, 0.0, 0.0),   # diagonal BR→TL
+    (0.5, 0.0, 0.5, 1.0),   # centre pan down
+    (0.0, 0.5, 1.0, 0.5),   # centre pan right
+]
+
+def _preload_bg(filename):
+    """Load, scale to 115% overscan, cache."""
+    if filename in _img_cache:
+        return _img_cache[filename]
+    path = os.path.join(BG_IMAGES_DIR, filename)
+    if not os.path.exists(path):
+        _img_cache[filename] = None
+        return None
+    try:
+        img = Image.open(path).convert("RGB")
+        bw, bh = img.size
+        # scale so it covers 1080×1920 with 15% room to pan
+        scale = max(W * 1.15 / bw, H * 1.15 / bh)
+        nw, nh = max(W+2, int(bw*scale)), max(H+2, int(bh*scale))
+        img = img.resize((nw, nh), Image.LANCZOS)
+        _img_cache[filename] = img
+        print(f"[BG] cached {filename} → {nw}×{nh}")
+        return img
+    except Exception as e:
+        print(f"[BG] load error {filename}: {e}")
+        _img_cache[filename] = None
+        return None
+
+
+def _ease_inout(t):
+    """Smooth ease-in-out curve (0→1)."""
+    t = max(0.0, min(1.0, t))
+    return t * t * (3 - 2 * t)
+
+
+def _render_kenburns_frame(bg_imgs_list, fi, total_frames):
+    """
+    Ken Burns with zoom-in/out alternation, longer crossfade (15%), subtle vignette.
+    """
+    n      = len(bg_imgs_list)
+    seg    = total_frames / n
+    i_cur  = min(int(fi / seg), n - 1)
+    i_nxt  = (i_cur + 1) % n
+    seg_t  = (fi - i_cur * seg) / max(seg, 1)   # 0.0 → 1.0
+
+    def _get_frame(img_obj, move_idx, t_ease, zoom_in=True):
+        if img_obj is None:
+            return Image.new("RGB", (W, H), (10, 8, 20))
+        bw, bh = img_obj.size
+        sx0, sy0, sx1, sy1 = _KB_MOVES[move_idx % len(_KB_MOVES)]
+
+        # Alternating zoom-in / zoom-out (13% travel instead of 8%)
+        ZOOM_AMT = 0.13
+        if zoom_in:
+            zoom = 1.0 + ZOOM_AMT * t_ease          # 1.00 → 1.13
+        else:
+            zoom = 1.0 + ZOOM_AMT * (1.0 - t_ease)  # 1.13 → 1.00
+
+        # Crop zoomed region from center
+        crop_w = int(W / zoom)
+        crop_h = int(H / zoom)
+        # pan offset on top of zoom crop
+        extra_x = bw - crop_w
+        extra_y = bh - crop_h
+        cx = int(sx0 * extra_x + (sx1 - sx0) * extra_x * t_ease)
+        cy = int(sy0 * extra_y + (sy1 - sy0) * extra_y * t_ease)
+        cx = max(0, min(max(0, extra_x), cx))
+        cy = max(0, min(max(0, extra_y), cy))
+        frame = img_obj.crop((cx, cy, cx + crop_w, cy + crop_h)).resize((W, H), Image.LANCZOS)
+
+        # Dark vignette overlay: 30% uniform + soft edge
+        dark = Image.new("RGB", (W, H), (0, 0, 0))
+        frame = Image.blend(frame, dark, 0.30)
+
+        # Add soft radial vignette (dark corners)
+        vig = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        dv  = ImageDraw.Draw(vig)
+        for r, alpha in [(540, 80), (440, 50), (360, 25)]:
+            dv.ellipse([W//2-r, H//2-r, W//2+r, H//2+r],
+                       fill=(0, 0, 0, 0), outline=(0, 0, 0, alpha), width=r//2)
+        frame_rgba = frame.convert("RGBA")
+        frame_rgba = Image.alpha_composite(frame_rgba, vig)
+        return frame_rgba.convert("RGB")
+
+    t_smooth  = _ease_inout(seg_t)
+    zoom_in   = (i_cur % 2 == 0)   # alternate zoom direction each image
+    cur_frame = _get_frame(bg_imgs_list[i_cur], i_cur, t_smooth, zoom_in)
+
+    # crossfade in last 15% of segment (was 10%)
+    if seg_t > 0.85 and n > 1:
+        blend_t   = (seg_t - 0.85) / 0.15
+        nxt_frame = _get_frame(bg_imgs_list[i_nxt], i_nxt, 0.0, not zoom_in)
+        # ease the blend curve for smooth dissolve
+        alpha = _ease_inout(blend_t)
+        cur_frame = Image.blend(cur_frame, nxt_frame, alpha)
+
+    return cur_frame
+
+
+def _draw_ambient_particles(d, accent_rgb, t):
+    """
+    Layered ambient bokeh — 3 depth layers: far (tiny dim), mid (medium), near (large faint).
+    Adds life without distracting from lyrics.
+    """
+    rng = random.Random(99)
+    # Layer config: (count, size_range, speed_mult, alpha_max, drift_scale)
+    layers = [
+        (14, (2, 5),   0.18, 0.30, 28),   # far — tiny, slow, very dim
+        (7,  (7, 14),  0.28, 0.20, 45),   # mid
+        (4,  (18, 32), 0.12, 0.10, 60),   # near — large, blurry-looking, very faint
+    ]
+    for count, (smin, smax), spd, amax, drift in layers:
+        for i in range(count):
+            sx   = rng.uniform(0.04, 0.96) * W
+            sy   = rng.uniform(0.04, 0.92) * H
+            ph   = rng.random() * math.pi * 2
+            size = rng.randint(smin, smax)
+            blink = 0.4 + 0.6 * abs(math.sin(t * spd + ph))
+            cx2  = int((sx + math.sin(t * 0.22 + ph) * drift) % W)
+            cy2  = int((sy + math.cos(t * 0.18 + ph) * (drift * 0.7)) % H)
+            alpha = amax * blink
+            col  = tuple(min(255, int(c * alpha)) for c in accent_rgb)
+            if not any(v > 3 for v in col): continue
+            d.ellipse([cx2-size, cy2-size, cx2+size, cy2+size], fill=col)
+            # ring outline for larger bokeh
+            if size >= 14:
+                ring_col = tuple(min(255, int(c * alpha * 0.4)) for c in accent_rgb)
+                d.ellipse([cx2-size-4, cy2-size-4, cx2+size+4, cy2+size+4],
+                           outline=ring_col, width=2)
+
+
+def _draw_floating_notes(d, accent_rgb, t):
+    """Music notes float up with wobble + fade — 4 notes at staggered positions."""
+    fnt_s = get_font(34, bold=False)
+    fnt_l = get_font(52, bold=False)
+    fnt_xl= get_font(66, bold=False)
+    notes = ["♪", "♫", "♩", "♬"]
+    sizes = [fnt_l, fnt_s, fnt_xl, fnt_s]
+    rng   = random.Random(55)
+    for i, note in enumerate(notes):
+        ph   = rng.random() * 10
+        sx   = int(W * rng.uniform(0.07, 0.93))
+        spd  = rng.uniform(48, 80)
+        raw_y = (H * 0.85) - ((t * spd + ph * 80) % (H * 0.82))
+        cy2   = int(raw_y)
+        if cy2 < 20: continue
+        fade  = max(0.0, min(1.0, raw_y / (H * 0.5)))
+        wobble = int(math.sin(t * 1.4 + ph) * 18)
+        # slight rotation effect via x offset
+        col = tuple(min(255, int(c * 0.55 * fade)) for c in accent_rgb)
+        if all(v < 5 for v in col): continue
+        try:
+            d.text((sx + wobble, cy2), note, fill=col, font=sizes[i])
+        except: pass
+
+
+def _draw_caption_song(d, lines_data, t, accent_rgb):
+    """
+    Song caption — cinematic subtitle style.
+    - Pill slides up when new line starts
+    - Word-by-word: upcoming=dim, active=white+glow, said=accent
+    - Glow underline (3-layer) under active word
+    - Accent border on pill, faint glow shadow
+    """
+    if not lines_data: return
+
+    cur = 0
+    for i, ld in enumerate(lines_data):
+        if t >= ld["start"]: cur = i
+
+    raw   = lines_data[cur]["text"]
+    text  = hindi_to_hinglish(raw)
+    words = text.split()
+    if not words: return
+
+    line_start = lines_data[cur]["start"]
+    dur     = max(0.1, lines_data[cur]["end"] - line_start)
+    prog    = max(0.0, min(1.0, (t - line_start) / dur))
+    n_shown = max(1, int(prog * (len(words) + 0.5)))
+
+    # ── Slide-up entrance (first 0.25s of each line) ─────────────────────────
+    ENTER_DUR = 0.25
+    enter_prog = min(1.0, (t - line_start) / ENTER_DUR)
+    enter_ease = _ease_inout(enter_prog)
+    slide_offset = int((1.0 - enter_ease) * 48)   # slides up 48px
+
+    # ── Auto font size ─────────────────────────────────────────────────────────
+    MAX_TEXT_W = W - 80
+    chosen_fnt = None
+    for fs in (72, 62, 52, 44, 38, 32):
+        f = get_font(fs, bold=True)
+        try:
+            bb = d.textbbox((0, 0), text, font=f)
+            if (bb[2] - bb[0]) <= MAX_TEXT_W:
+                chosen_fnt = f; break
+        except:
+            chosen_fnt = f; break
+    if chosen_fnt is None:
+        chosen_fnt = get_font(32, bold=True)
+    fnt_dim = get_font(chosen_fnt.size if hasattr(chosen_fnt,'size') else 44, bold=False)
+
+    try:
+        sb = d.textbbox((0,0), "Ag", font=chosen_fnt)
+        line_h = sb[3] - sb[1]
+    except:
+        line_h = 56
+
+    try:
+        bb_full = d.textbbox((0, 0), text, font=chosen_fnt)
+        text_w  = min(bb_full[2] - bb_full[0], MAX_TEXT_W)
+    except:
+        text_w = MAX_TEXT_W
+
+    PAD_H  = 44
+    PAD_V  = 22
+    pill_w  = text_w + PAD_H * 2
+    pill_x1 = (W - pill_w) // 2
+    pill_x2 = pill_x1 + pill_w
+    BASE_Y2 = H - 100
+    pill_y2 = BASE_Y2 + slide_offset
+    pill_y1 = pill_y2 - line_h - PAD_V * 2
+
+    # Glow shadow (3 layers, increasingly faint)
+    glow_col  = tuple(min(255, int(c * 0.22)) for c in accent_rgb)
+    for spread in (22, 14, 7):
+        d.rounded_rectangle([pill_x1-spread, pill_y1-spread//2,
+                              pill_x2+spread, pill_y2+spread//2],
+                             radius=32, fill=glow_col)
+
+    # Main pill
+    d.rounded_rectangle([pill_x1+4, pill_y1+4, pill_x2+4, pill_y2+4],
+                          radius=28, fill=(0, 0, 0))
+    d.rounded_rectangle([pill_x1, pill_y1, pill_x2, pill_y2],
+                          radius=28, fill=(6, 4, 18))
+    d.rounded_rectangle([pill_x1, pill_y1, pill_x2, pill_y2],
+                          radius=28, outline=accent_rgb, width=3)
+
+    # Word-by-word rendering
+    text_y = pill_y1 + PAD_V
+    cur_x  = (W - text_w) // 2
+
+    word_widths = []
+    sp_w = 14
+    for wi, word in enumerate(words):
+        try:
+            wb = d.textbbox((0,0), word, font=chosen_fnt)
+            word_widths.append(wb[2]-wb[0])
+            if wi == 0:
+                sb2 = d.textbbox((0,0), " ", font=chosen_fnt)
+                sp_w = sb2[2] - sb2[0]
+        except:
+            word_widths.append(len(word) * 28)
+
+    for wi, word in enumerate(words):
+        revealed  = wi < n_shown
+        is_active = wi == n_shown - 1
+        ww        = word_widths[wi]
+
+        if is_active:
+            # Active word: bright white
+            d.text((cur_x, text_y), word, fill=(255, 255, 255), font=chosen_fnt)
+            # 3-layer glow underline
+            for lw, la in [(10, 0.18), (6, 0.38), (3, 0.85)]:
+                uc = tuple(min(255, int(c * la)) for c in accent_rgb)
+                d.rectangle([cur_x - 2, text_y + line_h + 3,
+                              cur_x + ww + 2, text_y + line_h + 3 + lw],
+                             fill=uc)
+        elif revealed:
+            # Said: tinted accent, slightly softer
+            col = tuple(min(255, int(c * 0.72 + 55)) for c in accent_rgb)
+            d.text((cur_x, text_y), word, fill=col, font=chosen_fnt)
+        else:
+            # Upcoming: dark dim grey
+            d.text((cur_x, text_y), word, fill=(55, 50, 80), font=fnt_dim)
+
+        cur_x += ww + (sp_w if wi < len(words)-1 else 0)
+
+
+def render_frame(lines_data, fi, total_frames, cfg, title, bg_imgs=None):
+    """
+    Render one frame.
+    - bg_imgs (list of filenames) → song mode: Ken Burns + particles + captions only
+    - no bg_imgs → kids mode: generated bg + character + captions
+    """
+    t        = fi / FPS
+    progress = fi / max(total_frames, 1)
+    col1, col2 = cfg["bg"]
+    accent   = hex_rgb(cfg["accent"])
+    style    = cfg.get("style", "bright")
+
+    img = Image.new("RGB", (W, H), (8, 6, 20))
+
+    if bg_imgs:
+        # ── SONG MODE: Ken Burns background ──────────────────────────────────
+        # Pre-load all images
+        loaded = [_preload_bg(fn) for fn in bg_imgs]
+        loaded = [x for x in loaded if x is not None]
+        if not loaded:
+            loaded = [None]   # fallback: black bg
+
+        kb = _render_kenburns_frame(loaded, fi, total_frames)
+        img.paste(kb, (0, 0))
+        d = ImageDraw.Draw(img)
+
+        # Subtle ambient effects only — no characters
+        _draw_ambient_particles(d, accent, t)
+        _draw_floating_notes(d, accent, t)
+
+        # Song title — small, top, semi-transparent
+        _draw_song_title(d, title, accent)
+
+        # Synced captions
+        if lines_data:
+            _draw_caption_song(d, lines_data, t, accent)
+
     else:
-        draw_bg(d,col1,col2,t)
-        is_dark = hex_rgb(col1)[0]<80
-        if is_dark: draw_stars_bg(d,t)
-        else: draw_bokeh(d,accent,t)
+        # ── KIDS MODE: generated background + character ───────────────────────
+        d = ImageDraw.Draw(img)
+        if style == "lofi":
+            draw_lofi_bg(d, col1, col2, accent, t)
+        else:
+            draw_bg(d, col1, col2, t)
+            if hex_rgb(col1)[0] < 80: draw_stars_bg(d, t)
+            else: draw_bokeh(d, accent, t)
 
-    draw_title(d,title,accent,style)
+        draw_title(d, title, accent, style)
 
-    # Use lofi kid for lofi style
-    if style == "lofi":
-        draw_lofi_kid(d, W//2, int(H*0.76), t)
-    else:
-        char_fn = CHARS.get(cfg["char"],draw_kid)
-        char_fn(d, W//2, int(H*0.76), t)
+        if style == "lofi":
+            draw_lofi_kid(d, W//2, int(H*0.76), t)
+        else:
+            CHARS.get(cfg["char"], draw_kid)(d, W//2, int(H*0.76), t)
 
-    if lines_data:
-        draw_lyrics_simple(d, lines_data, t, accent, style,
-                           bg_image=bool(bg_image_paths))
-    draw_progress(d,progress,accent)
+        if lines_data:
+            draw_lyrics(d, lines_data, t, accent, style)
 
+    # Progress bar — always
+    d = ImageDraw.Draw(img)
+    draw_progress(d, progress, accent)
     return img
+
+
+def _draw_song_title(d, title, accent_rgb):
+    """Minimal title tag — top center, small, semi-transparent."""
+    if not title: return
+    title_display = hindi_to_hinglish(title)
+    clean = re.sub(r"[^\w\s\-\.]", "", title_display).strip()[:35]
+    fnt = get_font(38, bold=True)
+    try:
+        bb = d.textbbox((0, 0), clean, font=fnt)
+        tw = bb[2] - bb[0]
+    except:
+        tw = len(clean) * 22
+    tx = (W - tw) // 2
+    # dark pill
+    pad = 20
+    d.rounded_rectangle([tx-pad+3, 42+3, tx+tw+pad+3, 100+3], radius=16, fill=(0,0,0))
+    d.rounded_rectangle([tx-pad, 42, tx+tw+pad, 100], radius=16, fill=(12, 10, 28))
+    d.rounded_rectangle([tx-pad, 42, tx+tw+pad, 100], radius=16,
+                          outline=accent_rgb, width=2)
+    d.text((tx, 50), clean, fill=accent_rgb, font=fnt)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VIDEO BUILDER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_video(content, job_id, song_key="", bg_key="", char_override="", bg_image_keys=None):
+def build_video(content, job_id, song_key="", bg_key="", char_override="",
+                bg_image_keys=None):
     tmp = os.path.join("C:/tmp" if os.name=="nt" else "/tmp", f"kh7_{job_id}")
     os.makedirs(f"{tmp}/frames", exist_ok=True)
 
-    lines_text = content.get("lines",[])
-    title      = content.get("title","")
+    lines_text = content.get("lines", [])
+    title      = content.get("title", "")
+    bg_imgs    = [fn for fn in (bg_image_keys or [])
+                  if os.path.exists(os.path.join(BG_IMAGES_DIR, fn))]
 
-    # ── Resolve bg image paths ────────────────────────────────────────────────
-    bg_image_paths = []
-    if bg_image_keys:
-        for key in bg_image_keys:
-            fp = os.path.join(BG_IMAGES_DIR, key)
-            if os.path.exists(fp):
-                bg_image_paths.append(fp)
-    if bg_image_paths:
-        print(f"[Build] BG images: {[os.path.basename(p) for p in bg_image_paths]}")
-
-    # ── Find song: use song_key first, fall back to bg_key/title ─────────────
+    # ── Find song ─────────────────────────────────────────────────────────────
     search_key = song_key or bg_key or title
     jobs[job_id]["message"] = "🎵 Step 1/3: Song dhundh raha hai..."
     song_path = find_song(search_key)
-
     if not song_path:
         raise Exception(
-            f"Koi MP3 nahi mila!\nbackend/songs/ mein Suno .mp3 daalo.\n"
-            f"Song search key: '{search_key}'\nSongs folder: {SONGS_DIR}"
-        )
+            f"Koi MP3 nahi mila! backend/songs/ mein Suno .mp3 daalo.\n"
+            f"Song key: '{search_key}' | Folder: {SONGS_DIR}")
 
-    song_dur = get_duration(song_path)
+    song_dur     = get_duration(song_path)
     total_frames = int(song_dur * FPS)
-    jobs[job_id]["message"] = f"🎵 Song: {os.path.basename(song_path)} ({song_dur:.1f}s)"
-    print(f"[Build] Song: {song_path} | Dur: {song_dur:.1f}s | Frames: {total_frames}")
+    mode_label   = f"song-image({len(bg_imgs)}imgs)" if bg_imgs else "kids-anim"
+    jobs[job_id]["message"] = (
+        f"🎵 {os.path.basename(song_path)} ({song_dur:.1f}s) | mode: {mode_label}")
+    print(f"[Build] Song: {song_path} | {song_dur:.1f}s | {total_frames}f | {mode_label}")
 
-    # ── Get visual config from bg_key (theme) — NOT from song ────────────────
+    # ── Visual config (used for accent colour even in song mode) ──────────────
     cfg = get_config_by_bg_key(bg_key) if bg_key else get_config(search_key)
     if char_override and char_override in CHARS:
         cfg = dict(cfg); cfg["char"] = char_override
 
+    # Pre-load bg images into cache now (avoids lag during frame render)
+    if bg_imgs:
+        jobs[job_id]["message"] = "🖼️ Background images load ho rahi hain..."
+        for fn in bg_imgs:
+            _preload_bg(fn)
+
     # ── Lyrics timing ─────────────────────────────────────────────────────────
     n = len(lines_text)
-    if n == 0:
-        lines_data = []
-    else:
-        gap = song_dur / n
-        lines_data = []
-        for i,txt in enumerate(lines_text):
-            lines_data.append({"text":txt,"start":i*gap+0.3,"end":(i+1)*gap-0.2})
+    pre_timestamps = content.get("timestamps", [])   # whisper/manual timestamps
+    lines_data = []
+    if n > 0:
+        if pre_timestamps and len(pre_timestamps) == n:
+            # Use provided timestamps (whisper or manual)
+            lines_data = [
+                {"text": t.get("text", lines_text[i]),
+                 "start": float(t.get("start", 0)),
+                 "end":   float(t.get("end", song_dur))}
+                for i, t in enumerate(pre_timestamps)
+            ]
+            print(f"[Build] Using {'whisper' if content.get('sync_method')=='whisper' else 'manual'} timestamps")
+        else:
+            # Equal division fallback
+            gap = song_dur / n
+            for i, txt in enumerate(lines_text):
+                lines_data.append({
+                    "text":  txt,
+                    "start": i * gap + 0.4,
+                    "end":   (i + 1) * gap - 0.25
+                })
+            print(f"[Build] Using equal-division timing ({n} lines, {song_dur:.1f}s)")
 
     # ── Render frames ──────────────────────────────────────────────────────────
     jobs[job_id]["message"] = "🎨 Step 2/3: Frames render ho rahi hain..."
-    print(f"[Build] Rendering {total_frames} frames (style={cfg.get('style','bright')}, "
-          f"bg_imgs={len(bg_image_paths)})...")
+    print(f"[Build] Rendering {total_frames} frames...")
 
     for fi in range(total_frames):
         if fi % 30 == 0:
-            jobs[job_id]["progress"] = 10 + fi*75//max(total_frames,1)
+            jobs[job_id]["progress"] = 10 + fi * 75 // max(total_frames, 1)
         img = render_frame(lines_data, fi, total_frames, cfg, title,
-                           bg_image_paths=bg_image_paths or None)
+                           bg_imgs=bg_imgs if bg_imgs else None)
         img.save(f"{tmp}/frames/f{fi:05d}.png")
 
     # ── Encode ─────────────────────────────────────────────────────────────────
     jobs[job_id]["message"] = "🎬 Step 3/3: Video encode ho rahi hai..."
     out_dir = "C:/tmp/kh7_out" if os.name=="nt" else "/tmp/kh7_out"
-    os.makedirs(out_dir,exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     out = f"{out_dir}/{job_id}.mp4"
 
     r = subprocess.run([
         FFMPEG,
-        "-framerate",str(FPS), "-i",f"{tmp}/frames/f%05d.png",
-        "-i",song_path,
-        "-c:v","libx264","-preset","fast","-crf","20",
-        "-vf","scale=1080:1920","-pix_fmt","yuv420p",
-        "-c:a","aac","-b:a","192k","-shortest",
-        out,"-y","-loglevel","error"
+        "-framerate", str(FPS),
+        "-i", f"{tmp}/frames/f%05d.png",
+        "-i", song_path,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-vf", "scale=1080:1920", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest", out, "-y", "-loglevel", "error"
     ], capture_output=True, text=True)
 
-    if r.returncode != 0: raise Exception(f"FFmpeg failed: {r.stderr[:300]}")
-    shutil.rmtree(tmp,ignore_errors=True)
+    if r.returncode != 0:
+        raise Exception(f"FFmpeg failed: {r.stderr[:400]}")
+    shutil.rmtree(tmp, ignore_errors=True)
     return out
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  JOB RUNNER
@@ -1237,26 +1346,34 @@ def run_job(job_id, params):
         cl        = params.get("custom_lines",[])
         top       = params.get("topic","")
         cha       = params.get("char_override","")
-        # NEW: bg_key (theme) and song_key are separate
         bg_key    = params.get("bg_key","")
-        song_key  = bk  # builtin_key is the song lookup key
+
+        # song_key_override = explicit song picked by user in UI
+        # builtin_key = rhyme key (content), may or may not match a song
+        song_key_override = params.get("song_key_override","").strip()
 
         if bk and bk in BUILTIN:
-            content = BUILTIN[bk]
+            content  = BUILTIN[bk]
+            # Use override if given, else use builtin_key as song lookup
+            song_key = song_key_override or bk
         elif cl:
-            content = {"title":top or "Meri Kavita","lines":cl}
-            # For custom, song_key comes from builtin_key param (song selection)
-            song_key = params.get("builtin_key","") or top
+            content  = {"title":top or "Meri Kavita","lines":cl}
+            song_key = song_key_override or bk or top
         elif top:
             job["message"]="✍️ AI se likh raha hoon..."
             content = generate_ai(top,ct)
             if not content:
                 job["status"]="failed"; job["message"]="AI fail. GROQ_API_KEY check karo."; return
-            song_key = top
+            song_key = song_key_override or top
         else:
             job["status"]="failed"; job["message"]="Content chahiye."; return
 
         job["content"] = content
+        # Attach pre-computed timestamps if provided
+        if params.get("timestamps"):
+            content = dict(content)
+            content["timestamps"]  = params["timestamps"]
+            content["sync_method"] = params.get("sync_method", "manual")
         vp = build_video(content, job_id,
                          song_key=song_key,
                          bg_key=bg_key or bk,
@@ -1279,14 +1396,279 @@ def health():
     mp3s=[]
     try: mp3s=[f for f in os.listdir(SONGS_DIR) if f.endswith(".mp3")]
     except: pass
+    bg_imgs=[]
+    try: bg_imgs=[f for f in os.listdir(BG_IMAGES_DIR)
+                  if f.lower().endswith(('.jpg','.jpeg','.png','.webp'))]
+    except: pass
     return jsonify({"ok":True,"voices":["swara","madhur"],
         "builtins":list(BUILTIN.keys()),"suno_songs":mp3s,
         "songs_dir":SONGS_DIR,"mapping":_MAP,
+        "bg_images":bg_imgs,"bg_images_dir":BG_IMAGES_DIR,
         "ai":{"groq":bool(GROQ_KEY),"gemini":bool(GEMINI_KEY)}})
 
 @app.route("/api/builtins")
 def builtins_api():
     return jsonify({k:{"title":v["title"],"type":"rhyme"} for k,v in BUILTIN.items()})
+
+# ── Background Image Routes ───────────────────────────────────────────────────
+
+@app.route("/api/upload-bg-image", methods=["POST"])
+def upload_bg_image():
+    if "file" not in request.files: return jsonify({"error":"No file"}),400
+    f = request.files["file"]
+    fname_lower = f.filename.lower()
+
+    # ── IMAGE upload ──────────────────────────────────────────────────────────
+    if any(fname_lower.endswith(e) for e in ('.jpg','.jpeg','.png','.webp')):
+        safe = re.sub(r"[^\w\-.]","_",f.filename).lower()
+        fp   = os.path.join(BG_IMAGES_DIR, safe)
+        f.save(fp)
+        _img_cache.pop(safe, None)
+        return jsonify({"ok":True,"filename":safe,
+                        "size_kb":os.path.getsize(fp)//1024,
+                        "type":"image"})
+
+    # ── VIDEO CLIP upload (.mp4 / .mov) ───────────────────────────────────────
+    elif any(fname_lower.endswith(e) for e in ('.mp4','.mov','.webm')):
+        safe_vid = re.sub(r"[^\w\-.]","_",f.filename).lower()
+        tmp_vid  = os.path.join(BG_IMAGES_DIR, "tmp_" + safe_vid)
+        f.save(tmp_vid)
+
+        try:
+            dur = get_duration(tmp_vid)
+            base_name = safe_vid.rsplit('.',1)[0]
+
+            # Smart frame count: 1 frame per second, min 1, max 8
+            # For a 3s clip → 3 frames (0s, 1.5s, 3s)
+            n_frames = max(1, min(8, int(dur)))
+
+            # Spread timestamps evenly, never duplicate
+            if n_frames == 1:
+                ts_list = [dur / 2]  # just the middle frame
+            else:
+                # space them out with 0.5s gap from edges
+                margin = min(0.4, dur * 0.1)
+                span   = dur - 2 * margin
+                ts_list = [margin + span * i / (n_frames - 1) for i in range(n_frames)]
+
+            # Deduplicate: round to 2 decimal places, keep unique
+            seen = set()
+            ts_unique = []
+            for ts in ts_list:
+                key = round(ts, 2)
+                if key not in seen:
+                    seen.add(key); ts_unique.append(ts)
+
+            extracted = []
+            for idx, ts in enumerate(ts_unique):
+                out_jpg = os.path.join(BG_IMAGES_DIR, f"{base_name}_f{idx:02d}.jpg")
+                r = subprocess.run([
+                    FFMPEG,
+                    "-ss", f"{ts:.3f}",
+                    "-i", tmp_vid,
+                    "-vframes", "1",
+                    "-q:v", "2",
+                    "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+                    out_jpg, "-y", "-loglevel", "error"
+                ], capture_output=True)
+                if r.returncode == 0 and os.path.exists(out_jpg):
+                    extracted.append(f"{base_name}_f{idx:02d}.jpg")
+                    _img_cache.pop(f"{base_name}_f{idx:02d}.jpg", None)
+
+            os.remove(tmp_vid)
+
+            if not extracted:
+                return jsonify({"error": "Video se frames extract nahi hue — ffmpeg check karo"}), 400
+
+            return jsonify({
+                "ok": True,
+                "type": "video",
+                "frames": extracted,
+                "frame_count": len(extracted),
+                "duration_sec": round(dur, 1),
+                "source": safe_vid
+            })
+        except Exception as e:
+            if os.path.exists(tmp_vid): os.remove(tmp_vid)
+            return jsonify({"error": str(e)}), 500
+
+    else:
+        return jsonify({"error":"Only jpg/png/webp/mp4/mov/webm allowed"}),400
+
+@app.route("/api/bg-images")
+def list_bg_images():
+    imgs=[]
+    try:
+        for fname in sorted(os.listdir(BG_IMAGES_DIR)):
+            if fname.lower().endswith(('.jpg','.jpeg','.png','.webp')):
+                fp = os.path.join(BG_IMAGES_DIR,fname)
+                # detect if it's a video-extracted frame
+                is_vid_frame = bool(re.search(r'_f\d{2}\.jpg$', fname))
+                imgs.append({
+                    "filename": fname,
+                    "size_kb":  os.path.getsize(fp)//1024,
+                    "from_video": is_vid_frame,
+                })
+    except: pass
+    return jsonify(imgs)
+
+@app.route("/api/delete-bg-image/<fname>", methods=["DELETE"])
+def delete_bg_image(fname):
+    safe = re.sub(r"[^\w\-.]","_",fname)
+    fp   = os.path.join(BG_IMAGES_DIR,safe)
+    if not os.path.exists(fp): return jsonify({"error":"Not found"}),404
+    os.remove(fp); _img_cache.pop(safe,None)
+    return jsonify({"ok":True})
+
+@app.route("/api/bg-image/<fname>")
+def serve_bg_image(fname):
+    safe = re.sub(r"[^\w\-.]","_",fname)
+    fp   = os.path.join(BG_IMAGES_DIR,safe)
+    if not os.path.exists(fp): return jsonify({"error":"Not found"}),404
+    return send_file(fp)
+
+@app.route("/api/whisper-sync", methods=["POST"])
+def whisper_sync():
+    """
+    Auto-sync lyrics to song using Whisper.
+    POST { "song_key": "...", "lines": ["line1","line2",...] }
+    Returns { "ok": True, "timestamps": [{"text":..,"start":..,"end":..}, ...] }
+
+    Requires: pip install openai-whisper torch
+    """
+    try:
+        import whisper as _whisper
+    except ImportError:
+        return jsonify({
+            "ok": False,
+            "error": "Whisper install nahi hai",
+            "install": "pip install openai-whisper torch",
+            "note": "Ek baar install karo, phir auto-sync kaam karega"
+        }), 400
+
+    data = request.json or {}
+    song_key = data.get("song_key", "")
+    lines    = data.get("lines", [])
+    if not lines:
+        return jsonify({"ok": False, "error": "lines required"}), 400
+
+    song_path = find_song(song_key)
+    if not song_path:
+        return jsonify({"ok": False, "error": f"Song not found: {song_key}"}), 404
+
+    song_dur = get_duration(song_path)
+
+    try:
+        # Load smallest model for speed (tiny = ~70MB, fast)
+        model_name = data.get("model", "tiny")
+        model = _whisper.load_model(model_name)
+        result = model.transcribe(song_path, word_timestamps=True,
+                                   language="hi", task="transcribe")
+
+        # Match Whisper words/segments to our lines
+        # Strategy: use Whisper segments as timing anchors, snap our lines to nearest
+        segments = result.get("segments", [])
+        if not segments:
+            return jsonify({"ok": False, "error": "Whisper ne koi segment nahi diya"}), 400
+
+        # Build word timestamps from all segments
+        all_words = []
+        for seg in segments:
+            ws = seg.get("words", [])
+            if ws:
+                all_words.extend(ws)
+            else:
+                # no word-level — use segment
+                all_words.append({
+                    "word": seg.get("text","").strip(),
+                    "start": seg["start"],
+                    "end":   seg["end"]
+                })
+
+        if not all_words:
+            # Fallback: use segment times, divide among lines
+            n = len(lines)
+            gap = song_dur / max(n, 1)
+            ts = [{"text": lines[i], "start": i*gap+0.3, "end":(i+1)*gap-0.2}
+                  for i in range(n)]
+            return jsonify({"ok": True, "timestamps": ts,
+                             "method": "segment_fallback", "duration": song_dur})
+
+        # Total whisper duration
+        w_start = all_words[0]["start"]
+        w_end   = all_words[-1]["end"]
+        w_span  = max(w_end - w_start, 1)
+
+        # Divide words proportionally among lines (by character count)
+        total_chars = max(1, sum(len(l) for l in lines))
+        timestamps = []
+        word_idx = 0
+
+        for li, line in enumerate(lines):
+            # Expected fraction of words for this line
+            frac = len(line) / total_chars
+            n_words_for_line = max(1, round(frac * len(all_words)))
+            i_start = word_idx
+            i_end   = min(word_idx + n_words_for_line - 1, len(all_words)-1)
+            word_idx += n_words_for_line
+
+            t_start = all_words[i_start]["start"]
+            t_end   = all_words[min(i_end, len(all_words)-1)].get("end", t_start + 2)
+            timestamps.append({
+                "text":  line,
+                "start": round(t_start, 3),
+                "end":   round(t_end, 3)
+            })
+
+        # Clamp last line to song duration
+        if timestamps:
+            timestamps[-1]["end"] = min(song_dur - 0.1, timestamps[-1]["end"])
+
+        return jsonify({
+            "ok": True,
+            "timestamps": timestamps,
+            "method": "whisper",
+            "model": model_name,
+            "duration": song_dur,
+            "word_count": len(all_words)
+        })
+
+    except Exception as e:
+        # Graceful fallback: equal division
+        n   = len(lines)
+        gap = song_dur / max(n, 1)
+        ts  = [{"text": lines[i], "start": i*gap+0.3, "end":(i+1)*gap-0.2}
+               for i in range(n)]
+        return jsonify({
+            "ok": True,
+            "timestamps": ts,
+            "method": "equal_fallback",
+            "error": str(e),
+            "duration": song_dur
+        })
+
+
+@app.route("/api/whisper-status")
+def whisper_status():
+    """Check if whisper is installed."""
+    try:
+        import whisper as _whisper
+        return jsonify({"available": True, "models": ["tiny","base","small"]})
+    except ImportError:
+        return jsonify({
+            "available": False,
+            "install": "pip install openai-whisper torch",
+            "note": "Ek baar install karo — tiny model ~70MB download hoga"
+        })
+
+
+@app.route("/api/stream-song/<fname>")
+def stream_song(fname):
+    safe = re.sub(r"[^\w\-.]","_", fname)
+    fp   = os.path.join(SONGS_DIR, safe)
+    if not os.path.exists(fp): return jsonify({"error":"Not found"}),404
+    return send_file(fp, mimetype="audio/mpeg")
+
 
 @app.route("/api/generate",methods=["POST"])
 def generate():
@@ -1364,54 +1746,6 @@ def map_song():
     if not os.path.exists(os.path.join(SONGS_DIR,fname)): return jsonify({"error":"File not found"}),404
     _MAP[key]=fname; save_mapping(_MAP)
     return jsonify({"ok":True,"mapped":f"{key}->{fname}"})
-
-# ── Background Image API ──────────────────────────────────────────────────────
-
-@app.route("/api/upload-bg-image", methods=["POST"])
-def upload_bg_image():
-    if "file" not in request.files:
-        return jsonify({"error":"No file"}), 400
-    f = request.files["file"]
-    allowed = ('.jpg','.jpeg','.png','.webp')
-    if not any(f.filename.lower().endswith(e) for e in allowed):
-        return jsonify({"error":"Only jpg/jpeg/png/webp allowed"}), 400
-    safe = re.sub(r"[^\w\-.]","_", f.filename).lower()
-    fp   = os.path.join(BG_IMAGES_DIR, safe)
-    f.save(fp)
-    if fp in _bg_img_cache: del _bg_img_cache[fp]   # clear stale cache
-    return jsonify({"ok":True, "filename":safe,
-                    "size_kb": os.path.getsize(fp)//1024})
-
-@app.route("/api/bg-images")
-def list_bg_images():
-    imgs = []
-    try:
-        for fname in sorted(os.listdir(BG_IMAGES_DIR)):
-            if fname.lower().endswith(('.jpg','.jpeg','.png','.webp')):
-                fp = os.path.join(BG_IMAGES_DIR, fname)
-                imgs.append({"filename": fname,
-                             "size_kb":  os.path.getsize(fp)//1024})
-    except: pass
-    return jsonify(imgs)
-
-@app.route("/api/delete-bg-image/<fname>", methods=["DELETE"])
-def delete_bg_image(fname):
-    safe = re.sub(r"[^\w\-.]","_", fname)
-    fp   = os.path.join(BG_IMAGES_DIR, safe)
-    if not os.path.exists(fp):
-        return jsonify({"error":"Not found"}), 404
-    os.remove(fp)
-    if fp in _bg_img_cache: del _bg_img_cache[fp]
-    return jsonify({"ok":True})
-
-@app.route("/api/bg-image/<fname>")
-def serve_bg_image(fname):
-    safe = re.sub(r"[^\w\-.]","_", fname)
-    fp   = os.path.join(BG_IMAGES_DIR, safe)
-    if not os.path.exists(fp):
-        return jsonify({"error":"Not found"}), 404
-    return send_file(fp)
-
 
 if __name__=="__main__":
     print("="*55)
